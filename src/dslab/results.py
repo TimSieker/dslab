@@ -91,9 +91,9 @@ def load_diagnostics(exp: Experiment, run: str, split: str) -> xr.Dataset:
     return xr.open_dataset(exp.eval_dir / run / split / "diagnostics.nc")
 
 
-def load_fields(exp: Experiment, split: str, dates, var: str, run: str | None = None, member: int = 0):
-    """Fields of single days, (D, H, W): ground truth (run=None, read from the cache) or one member
-    of a run's predictions. Only plain (not combined) splits."""
+def load_fields(exp: Experiment, split: str, dates, var: str, run: str | None = None, member=0):
+    """Fields of single days, (D, H, W): ground truth (run=None, read from the cache) or one member of a
+    run's predictions (member="mean": ensemble mean). Only plain (not combined) splits."""
     import numpy as np
 
     from .data import _load_source
@@ -106,14 +106,21 @@ def load_fields(exp: Experiment, split: str, dates, var: str, run: str | None = 
     with xr.open_dataset(exp.predictions_dir / run / f"{split}.nc") as ds:
         days = ds["time"].values.astype("datetime64[D]")
         idx = [int(np.flatnonzero(days == d)[0]) for d in dates]
-        return ds[var].isel(member=member, time=idx).values
+        da = ds[var].isel(time=idx)
+        return (da.mean("member") if member == "mean" else da.isel(member=member)).values
 
 
 def load_history(exp: Experiment, run: str) -> pd.DataFrame | None:
-    """Per-epoch training history of a neural run (None for models without one)."""
+    """Training history of a neural run (None for models without one). Column `epochs_done` = passes over
+    the training data completed at that record; `attrs["loss_name"]` names the training loss."""
     f = exp.runs_dir / run / "fit_info.json"
-    hist = json.loads(f.read_text()).get("history") if f.exists() else None
-    return pd.DataFrame(hist) if hist else None
+    info = json.loads(f.read_text()) if f.exists() else {}
+    if not info.get("history"):
+        return None
+    h = pd.DataFrame(info["history"])
+    h["epochs_done"] = h["epoch"] if "samples" in h else h["epoch"] + 1
+    h.attrs["loss_name"] = info.get("loss_name", "MSE of standardised targets")
+    return h
 
 
 def _split_time(exp: Experiment, split: str):

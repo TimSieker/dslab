@@ -138,12 +138,24 @@ def crps_ensemble(pred: np.ndarray, truth: np.ndarray, chunk: int = 256) -> floa
     return float(total / truth.size)
 
 
-def spread_skill(pred: np.ndarray, truth: np.ndarray) -> float:
-    """Ratio of ensemble spread to ensemble-mean RMSE, with the (M+1)/M finite-ensemble factor (~1 if calibrated)."""
-    M = pred.shape[0]
-    spread = np.sqrt(pred.var(axis=0, ddof=1, dtype=np.float64).mean() * (M + 1) / M)
-    skill = np.sqrt(np.mean((pred.mean(axis=0, dtype=np.float64) - truth) ** 2))
-    return float(spread / skill)
+def spread_skill(pred: np.ndarray, truth: np.ndarray, chunk: int = 256) -> float:
+    """Ratio of ensemble spread to ensemble-mean RMSE, with the (M+1)/M finite-ensemble factor (~1 if calibrated).
+    Accumulated over time chunks to keep memory low for large ensembles."""
+    M, T = pred.shape[:2]
+    var_sum = sq_err = 0.0
+    for i in range(0, T, chunk):
+        p = pred[:, i:i + chunk].astype(np.float64)
+        var_sum += p.var(axis=0, ddof=1).sum()
+        sq_err += ((p.mean(axis=0) - truth[i:i + chunk]) ** 2).sum()
+    spread = np.sqrt(var_sum / truth.size * (M + 1) / M)
+    return float(spread / np.sqrt(sq_err / truth.size))
+
+
+def miscalibration(rank_counts: np.ndarray) -> float:
+    """MCB (Schillinger et al. 2025, used by Debeire et al. 2026): mean squared deviation of the relative
+    rank frequencies from uniform; 0 = perfectly calibrated."""
+    h = rank_counts / rank_counts.sum()
+    return float(np.mean((h - 1 / len(h)) ** 2))
 
 
 def rank_histogram(pred: np.ndarray, truth: np.ndarray, stride: int = 4, seed: int = 0) -> np.ndarray:

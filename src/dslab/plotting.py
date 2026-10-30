@@ -431,23 +431,25 @@ def fig_scorecard_strips(card, colors: dict, title: str = "", save=None):
 
 
 def fig_training_curves(histories: dict, colors: dict, save=None):
-    """histories: run -> DataFrame(epoch, train_loss, val_loss); best epoch marked on the val panel."""
+    """One panel per run (the training losses of different models are different quantities): training
+    loss (grey) and validation loss (run colour) against passes over the training data; the dot marks
+    the checkpoint that is kept."""
     if not histories:
         return None
-    fig, (a1, a2) = plt.subplots(1, 2, figsize=(10, 3.4), sharey=True, gridspec_kw={"wspace": 0.08})
-    for run, h in histories.items():
-        a1.plot(h.epoch + 1, h.train_loss, color=colors[run], label=run)
-        a2.plot(h.epoch + 1, h.val_loss, color=colors[run], label=run)
+    n = len(histories)
+    fig, axes = plt.subplots(1, n, figsize=(4.8 * n, 3.4), squeeze=False, layout="constrained")
+    for ax, (run, h) in zip(axes[0], histories.items()):
+        ax.plot(h.epochs_done, h.train_loss, color=MUTED, label="training")
+        ax.plot(h.epochs_done, h.val_loss, color=colors[run], label="validation")
         best = h.val_loss.idxmin()
-        a2.plot(h.epoch[best] + 1, h.val_loss[best], "o", color=colors[run], ms=6,
-                markeredgecolor=SURFACE, markeredgewidth=1.5)
-    for a, title in ((a1, "Training loss"), (a2, "Validation loss (dot = kept epoch)")):
-        a.set_yscale("log")
-        a.set_xscale("log")
-        a.set_xlabel("epoch")
-        a.set_title(title)
-    a1.set_ylabel("MSE (standardised units)")
-    a1.legend()
+        ax.plot(h.epochs_done[best], h.val_loss[best], "o", color=colors[run], ms=7,
+                markeredgecolor=SURFACE, markeredgewidth=1.5, label="kept")
+        ax.set_xscale("log")
+        ax.set_yscale("log")
+        ax.set_xlabel("passes over the training data")
+        ax.set_ylabel(h.attrs.get("loss_name", "loss"))
+        ax.set_title(run)
+        ax.legend()
     _savefig(fig, save)
     return fig
 

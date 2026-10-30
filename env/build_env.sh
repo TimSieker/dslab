@@ -12,7 +12,7 @@ module load git
 
 micromamba create -y -p "$PREFIX" -f "$CODE/env/conda-base.yml"
 PY="$PREFIX/bin/python"
-"$PY" -m pip install --index-url https://download.pytorch.org/whl/cu128 torch==2.10.0
+"$PY" -m pip install --index-url https://download.pytorch.org/whl/cu128 torch==2.10.0 torchvision==0.25.0
 cd "$CODE"
 "$PY" -m pip install -c env/pip-constraints.txt -r env/pip-requirements.txt
 "$PY" -m pip check

@@ -187,3 +187,43 @@ unchanged, so nothing new is predicted by default.
 Phase C: conditional flow matching with the same U-Net backbone (time-conditioned `UNet`, already in
 `networks.py`), (a) plain, (b) residual on top of the `unet` run (CorrDiff-style); ensembles of 10 members.
 Estimate ≈ 1–1.5 GPU-h training + ≈ 0.5 GPU-h sampling per variant (to be measured on gpu-devel first).
+
+## 2026-10-30: Phase C start, adaptive flow matching (AFM)
+
+User: commit (done: `e428f91`); implement the flow-matching algorithm of Debeire et al. (2026, arXiv:2604.03459)
+with the same loss but **without the conservation loss** (their "AFM-baseline"); notebook: show only `unet`
+(deterministic baseline) and the FM model; ask before heavy compute.
+
+- `src/dslab/models/afm.py` (paper → code mapping in the docstring), `configs/models/afm.yaml`,
+  `tests/test_afm.py` (loss identity w(σ)‖D−x1‖² = ‖F−target‖², tiny CPU training, sampling, save/load: pass).
+- Details taken from the original AFM paper (Fotiadis et al. 2025, arXiv:2410.19814) where Debeire et al. defer
+  to it: σ_max = EMA of the encoder's RMS error (ML noise estimate), per channel, init 1.0; flow gradients reach
+  the encoder; SongUNet-L = 32 channels, mult [1,2,2,4,4], ~12 M parameters (ours: 11.9 M each), attention at
+  the lowest resolution, dropout 0.13.
+- Choices (not fixed by the papers): statics orography + latitude (no land-sea mask in the benchmark); scalar
+  noise label ln(s·RMS(σ_max))/4 (channels share t); σ_min relative to RMS(σ_max); σ_max EMA factor 0.01 per
+  micro-batch; batches drawn with replacement; EDM-style EMA ramp-up (0.05); pr clipped at 0 after sampling.
+- Environment: + nvidia-physicsnemo 2.1.1 (SongUNet), torchvision 0.25.0+cu128; `pip check` clean.
+- Evaluation: memory-safe for ensembles (pre-allocated loading, chunked spread/skill), + MCB.
+
+| job | what | resources | wall | notes |
+|---|---|---|---|---|
+| 28582366 | AFM smoke test: 51,200 samples, val prediction 12 members × 50 steps, evaluation | 1 A100-80GB | 18 min | pipeline OK; 145 samples/s; 662 denoiser evals/s; 38.5 GB GPU |
+| 28582579 | throughput benchmark (`scripts/bench_afm.py`) | 1 A100-80GB | 25 min | see below |
+
+Benchmark (SongUNet-L ×2, 128×128, bf16): training 152 samples/s (micro-batch 64) → **273/s with
+`torch.compile`** (batch 256 in one pass, 65 GB); sampling 714 → **2,300 denoiser evaluations/s** with
+`torch.compile` + channels-last. Estimates with compile: 2 M training samples ≈ 2.1 h, 6 M ≈ 6.1 h; prediction of
+val + 3 test splits with 12 members × 50 steps (13.6 M evaluations) ≈ 1.6–1.8 h. GPU used so far in Phase C ≈ 0.7 GPU-h.
+
+### Status at end of day (2026-10-30) — next steps
+
+Nothing running. Awaiting the user's choice of AFM run (estimates with `torch.compile`, measured on A100-80GB):
+1. 2 M samples, 12 members everywhere ≈ 4 GPU-h (recommended); 2. 2 M, 5 members for the future splits ≈ 3.2 GPU-h;
+3. 6 M samples (paper length) ≈ 8 GPU-h (> 5 GPU-h threshold). Also offered: checkpoint/resume to extend 2 M → 6 M.
+To do before the real run: add `torch.compile` (+ channels-last for sampling) to `afm.py` and re-test briefly;
+run with `TRAIN_TIME=... EVAL_CPUS=40 bash jobs/submit_model.sh alps_esd afm`. Then apply
+`notebooks/build_evaluation_notebook.py` (runs unet + afm), execute, and rewrite the findings notes.
+Smoke-test artefacts `afm-smoke` (runs/, predictions/, eval/; val only, 1.1 GB) can be deleted.
+The AFM code and the env change (PhysicsNeMo) are not committed yet.
+

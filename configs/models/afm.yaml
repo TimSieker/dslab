@@ -1,0 +1,31 @@
+# Adaptive flow matching as in Debeire et al. (2026, arXiv:2604.03459) without the conservation loss
+# ("AFM-baseline"); see src/dslab/models/afm.py for the paper -> code mapping and the open choices.
+model: afm
+params:
+  # data: z-score per variable with training statistics (paper Sect. 2.2); statics: orography, latitude
+  transform: {}
+  normalize: variable
+  statics: [orog, lat]
+  # encoder and denoiser: SongUNet-L (Fotiadis et al. 2025): 32 channels, mult [1,2,2,4,4], ~12 M parameters
+  model_channels: 32
+  channel_mult: [1, 2, 2, 4, 4]
+  num_blocks: 4
+  attn_resolutions: [8]
+  dropout: 0.13
+  # objective (Eq. 2-3)
+  lambda_enc: 0.25
+  sigma_max_init: 1.0
+  sigma_max_beta: 0.01
+  # optimisation (Sect. 3.4); the paper trains 6e6 samples (2e6 in its ablation)
+  lr: 2.0e-4
+  betas: [0.9, 0.999]
+  batch_size: 256
+  micro_batch: 64
+  train_samples: 2000000
+  ema_halflife: 500000
+  eval_every: 100000
+  # sampling (Eq. 4)
+  n_members: 12
+  n_steps: 50
+  rho: 7.0
+  sigma_min: 0.002

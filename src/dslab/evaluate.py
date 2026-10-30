@@ -40,13 +40,21 @@ def load_truth(exp: Experiment, split: str):
 
 
 def load_pred(exp: Experiment, run: str, split: str, var: str):
-    """(time, pred) with pred (M, T, H, W)."""
-    times, arrs = [], []
-    for s in _parts(exp, split):
-        with xr.open_dataset(exp.predictions_dir / run / f"{s}.nc") as ds:
-            arrs.append(ds[var].transpose("member", "time", ...).values)
+    """(time, pred) with pred (M, T, H, W); combined splits are read into one pre-allocated array."""
+    paths = [exp.predictions_dir / run / f"{s}.nc" for s in _parts(exp, split)]
+    shapes, times = [], []
+    for path in paths:
+        with xr.open_dataset(path) as ds:
+            shapes.append(ds[var].transpose("member", "time", ...).shape)
             times.append(ds["time"].values)
-    return np.concatenate(times), np.concatenate(arrs, axis=1)
+    M, _, H, W = shapes[0]
+    out = np.empty((M, sum(s[1] for s in shapes), H, W), np.float32)
+    i = 0
+    for path, shp in zip(paths, shapes):
+        with xr.open_dataset(path) as ds:
+            out[:, i:i + shp[1]] = ds[var].transpose("member", "time", ...).values
+        i += shp[1]
+    return np.concatenate(times), out
 
 
 def variable_scores(var: str, pred: np.ndarray, truth: np.ndarray, time: np.ndarray,
@@ -126,6 +134,7 @@ def variable_scores(var: str, pred: np.ndarray, truth: np.ndarray, time: np.ndar
     if n_mem > 1:
         s["Spread/skill"] = M.spread_skill(pred, truth)
         d["rank_hist"] = M.rank_histogram(pred, truth)
+        s["MCB"] = M.miscalibration(d["rank_hist"])
         d["spec_ensmean"] = spec.time_mean(ens)
     return s, d
 

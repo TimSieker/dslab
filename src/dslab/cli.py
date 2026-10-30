@@ -99,7 +99,7 @@ def cmd_predict(args):
     run_dir = exp.runs_dir / args.run
     model = Downscaler.load(run_dir)
     grid = load_grid(exp)
-    members = args.members or (10 if model.stochastic else 1)
+    members = args.members or model.params.get("n_members", 10 if model.stochastic else 1)
     for split in args.splits or exp.default_splits:
         t0 = time.time()
         s = load_split(exp, split)
@@ -143,7 +143,7 @@ def main(argv=None):
     sp.add_argument("--exp", required=True)
     sp.add_argument("--run", required=True)
     sp.add_argument("--splits", nargs="*")
-    sp.add_argument("--members", type=int, help="ensemble size (default 1, or 10 for stochastic models)")
+    sp.add_argument("--members", type=int, help="ensemble size (default: the model's n_members, 1 if deterministic)")
     sp.add_argument("--seed", type=int, default=0)
     sp.set_defaults(func=cmd_predict)
 

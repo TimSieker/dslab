@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import pandas as pd
 import xarray as xr
@@ -70,6 +71,22 @@ def scorecard(exp: Experiment, split: str, runs: list[str] | None = None,
     return wide[order]
 
 
+def rank_vs_published(card: pd.DataFrame) -> pd.DataFrame:
+    """For each of our runs and metric: 'k / N' = number of published entries that score better, out of N.
+    card: output of scorecard() without ref_models (all published entries)."""
+    pub = card.xs("published", level="source")
+    ours = card.xs("this study", level="source")
+    out = pd.DataFrame(index=ours.index, columns=card.columns, dtype=object)
+    for col in card.columns:
+        p = pub[col].dropna()
+        hi = BETTER.get(col[1], -1) > 0
+        for run, v in ours[col].items():
+            if pd.notna(v):
+                n_better = int((p > v).sum() if hi else (p < v).sum())
+                out.loc[run, col] = f"{n_better} / {len(p)}"
+    return out
+
+
 def load_diagnostics(exp: Experiment, run: str, split: str) -> xr.Dataset:
     return xr.open_dataset(exp.eval_dir / run / split / "diagnostics.nc")
 
@@ -92,6 +109,97 @@ def load_fields(exp: Experiment, split: str, dates, var: str, run: str | None = 
         return ds[var].isel(member=member, time=idx).values
 
 
+def load_history(exp: Experiment, run: str) -> pd.DataFrame | None:
+    """Per-epoch training history of a neural run (None for models without one)."""
+    f = exp.runs_dir / run / "fit_info.json"
+    hist = json.loads(f.read_text()).get("history") if f.exists() else None
+    return pd.DataFrame(hist) if hist else None
+
+
+def _split_time(exp: Experiment, split: str):
+    """Time axis of a split (from the data cache; combined splits concatenated)."""
+    import numpy as np
+
+    from .data import _cache_dir, _load_source
+
+    parts = exp.combined_splits.get(split, (split,))
+    times = []
+    for part in parts:
+        src = exp.source(part)
+        d = _cache_dir(exp, src)
+        if not (d / "time.npy").exists():
+            _load_source(exp, src)
+        t = np.load(d / "time.npy")
+        if part in ("train", "val"):
+            is_val = np.isin(pd.DatetimeIndex(t).year, exp.val_years)
+            t = t[is_val] if part == "val" else t[~is_val]
+        times.append(t)
+    return times
+
+
+def describe_split(exp: Experiment, split: str) -> str:
+    """One line: period(s), number of days and predictor type of a split."""
+    times = _split_time(exp, split)
+    parts = exp.combined_splits.get(split, (split,))
+    n = sum(len(t) for t in times)
+    years = ", ".join(map(str, exp.val_years))
+    if split == "val":
+        period = years
+    elif split == "train":
+        period = f"{pd.Timestamp(times[0][0]).year}–{pd.Timestamp(times[0][-1]).year} without {years}"
+    else:
+        period = " + ".join(f"{pd.Timestamp(t[0]).year}–{pd.Timestamp(t[-1]).year}" for t in times)
+        if len(parts) > 1:
+            period += " pooled"
+    path = str(exp.source(parts[0]).predictors)
+    gcm = Path(path).stem.split("_")[0]
+    kind = (f"imperfect predictors: {gcm} GCM fields" if "imperfect" in path
+            else f"perfect predictors: upscaled {gcm}-driven RCM fields")
+    return f"`{split}` ({period}; {n} days; {kind})"
+
+
+def caption(exp: Experiment, shown: str, splits, runs, scores: pd.DataFrame | None = None):
+    """Markdown block stating what a figure shows, what the models were trained on and what they are
+    evaluated on (derived from the experiment config and the data cache, so it stays correct)."""
+    from IPython.display import Markdown
+
+    splits = [splits] if isinstance(splits, str) else list(splits)
+    runs_txt = ", ".join(runs)
+    if scores is not None and len(scores):
+        m = scores[scores.run.isin(runs)].groupby("run").n_members.max()
+        runs_txt = ", ".join(f"{r} ({int(m[r])} members)" if m.get(r, 1) > 1 else r for r in runs)
+        if all(m.get(r, 1) == 1 for r in runs):
+            runs_txt += " (all deterministic)"
+    text = (f"**Shown:** {shown}  \n"
+            f"**Trained on:** {describe_split(exp, 'train')}; model selection on {describe_split(exp, 'val')}.  \n"
+            f"**Evaluated on:** " + "; ".join(describe_split(exp, s) for s in splits) +
+            f". Truth: {exp.truth}.  \n"
+            f"**Runs:** {runs_txt}")
+    return Markdown(text)
+
+
+def benchmark_tests(exp: Experiment, runs: list[str] | None = None) -> pd.DataFrame:
+    """The benchmark's tests for this experiment: period, predictors, whether they enter the published
+    scorecard, and which runs have been evaluated on them. Reads only the config and eval directories."""
+    import re
+
+    runs = list_runs(exp) if runs is None else runs
+    rows = []
+    for t in exp.benchmark_tests:
+        split = t["split"]
+        parts = exp.combined_splits.get(split, (split,))
+        files = [exp.source(part).predictors for part in parts]
+        periods = " + ".join(m for f in files for m in re.findall(r"\d{4}-\d{4}", f.stem))
+        gcm = files[0].stem.split("_")[0]
+        kind = "imperfect (GCM)" if "imperfect" in str(files[0]) else "perfect (upscaled RCM)"
+        done = [r for r in runs if (exp.eval_dir / r / split / "scores.json").exists()]
+        rows.append({"test": t["test"], "name": t["name"], "split": split, "period": periods.replace("-", "–"),
+                     "predictors": kind, "driving GCM": gcm,
+                     "in published scorecard": "yes" if split in exp.reference.get("splits", {}) else "",
+                     "evaluated runs": ", ".join(done) or "—"})
+    return pd.DataFrame(rows).set_index("test")
+
+
 def run_info(exp: Experiment, runs: list[str]) -> pd.DataFrame:
     rows = []
     for run in runs:
@@ -99,7 +207,12 @@ def run_info(exp: Experiment, runs: list[str]) -> pd.DataFrame:
         spec = yaml.safe_load((d / "model.yaml").read_text()) if (d / "model.yaml").exists() else {}
         info = json.loads((d / "fit_info.json").read_text()) if (d / "fit_info.json").exists() else {}
         meta = yaml.safe_load((d / "run.yaml").read_text()) if (d / "run.yaml").exists() else {}
-        rows.append({"run": run, "model": spec.get("model"), "params": spec.get("params"),
-                     "selected": info.get("selected"), "fit_seconds": info.get("wall_seconds"),
+        from .models import REGISTRY
+
+        cls = REGISTRY.get(spec.get("model"))
+        rows.append({"run": run, "model": spec.get("model"), "summary": getattr(cls, "summary", ""),
+                     "n_params": info.get("n_params"), "hardware": info.get("device", "CPU"),
+                     "fit_seconds": info.get("wall_seconds"), "epochs": info.get("epochs"),
+                     "selected": info.get("selected"), "params": spec.get("params"),
                      "fitted": meta.get("time"), "git_commit": (meta.get("git_commit") or "")[:8]})
     return pd.DataFrame(rows).set_index("run")

@@ -155,8 +155,8 @@ def robust_abs(arrays, q=98) -> float:
     return float(np.percentile(v, q)) if v.size else 1.0
 
 
-def _cbar(fig, m, ax, label=None, location="bottom"):
-    cb = fig.colorbar(m, ax=ax, location=location, shrink=0.85, aspect=25, pad=0.02)
+def _cbar(fig, m, ax, label=None, location="bottom", extend="neither"):
+    cb = fig.colorbar(m, ax=ax, location=location, shrink=0.85, aspect=25, pad=0.02, extend=extend)
     cb.outline.set_edgecolor(AXIS)
     cb.ax.tick_params(labelsize=7, color=AXIS)
     if label:
@@ -199,7 +199,8 @@ def fig_field_maps(diags: dict, var: str, name: str, label: str, mg: MapGrid, cm
     norm = Normalize(lo if vmin is None else vmin, hi if vmax is None else vmax)
     for j, (run, v) in enumerate(zip(runs, vals)):
         m = draw_map(axes[0, j], mg, v, cmap or SEQ["pr"], norm, run)
-    _cbar(fig, m, axes[0, :], label, location="right")
+    extend = "min" if np.nanmin(np.stack(vals)) < norm.vmin else "neither"
+    _cbar(fig, m, axes[0, :], label, location="right", extend=extend)
     fig.suptitle(f"{LABELS[var]}: {label}", x=0.0, ha="left", fontsize=11, color=INK)
     _savefig(fig, save)
     return fig
@@ -270,29 +271,51 @@ def _wavelength_km(nbins: int, n: int = 128) -> np.ndarray:
 
 
 def fig_spectra(diags: dict, var: str, colors: dict, save=None):
+    """Mean radial spectra over all bins used by the published RALSD. Bins beyond the Nyquist
+    wavenumber (shaded) are the grid's diagonal 'corners' (pixel-scale texture); 25 of the 90 bins."""
     runs = list(diags)
     d0 = diags[runs[0]]
     st = d0[f"{var}_spec_true"].values
     n = len(st)
-    lam = _wavelength_km(n)
-    sel = slice(1, 65)  # up to Nyquist (2 dx = 25 km); higher bins are grid corners
+    k = np.arange(n)
+    nyq = int(d0.sizes.get(d0["lat"].dims[0], 128)) // 2
     fig, (a1, a2) = plt.subplots(1, 2, figsize=(10, 3.6), gridspec_kw={"wspace": 0.25})
-    a1.loglog(lam[sel], st[sel], color=TRUTH_COLOR, lw=2.2, label="RCM truth")
+    a1.loglog(k[1:], st[1:], color=TRUTH_COLOR, lw=2.2, label="RCM truth")
     for r in runs:
         sp = diags[r][f"{var}_spec_pred"].values
-        a1.loglog(lam[sel], sp[sel], color=colors[r], label=r)
-        a2.semilogx(lam[sel], 10 * np.log10(sp[sel] / st[sel]), color=colors[r], label=r)
+        a1.loglog(k[1:], sp[1:], color=colors[r], label=r)
+        a2.semilogx(k[1:], 10 * np.log10(sp[1:] / st[1:]), color=colors[r], label=r)
     a2.axhline(0, color=AXIS, lw=1)
     for a in (a1, a2):
-        a.invert_xaxis()
-        a.set_xlabel("wavelength (km)")
+        a.axvspan(nyq, n, color=GRID, alpha=0.6, lw=0, zorder=0)
+        a.set_xlim(1, n)
+        a.set_xlabel("wavenumber bin  (wavelength = 1600 km / k)")
+        sec = a.secondary_xaxis("top", functions=(lambda x: 128 * DX_KM / np.maximum(x, 1e-9),
+                                                   lambda x: 128 * DX_KM / np.maximum(x, 1e-9)))
+        sec.set_xlabel("wavelength (km)", fontsize=8, color=INK2)
+        sec.tick_params(labelsize=7, colors=AXIS, labelcolor=INK2)
+    a1.text(nyq * 0.95, a1.get_ylim()[1] * 0.5, "beyond Nyquist\n(grid corners) →", ha="right", va="top",
+            fontsize=7, color=MUTED)
     a1.set_ylabel("power")
     a2.set_ylabel("prediction / truth (dB)")
-    a1.set_title(f"{LABELS[var]}: mean radial power spectrum")
-    a2.set_title("Spectral ratio (0 dB = right amount of small-scale variance)")
+    a1.set_title(f"{LABELS[var]}: mean radial power spectrum", pad=28)
+    a2.set_title("Spectral ratio (RALSD = mean square of this curve)", pad=28)
     a1.legend(loc="lower left")
     _savefig(fig, save)
     return fig
+
+
+def ralsd_split(diags: dict, var: str) -> dict:
+    """Published RALSD of each run split into resolved scales (k <= Nyquist) and grid-corner bins."""
+    from .metrics import ralsd
+
+    out = {}
+    for r, d in diags.items():
+        st, sp = d[f"{var}_spec_true"].values, d[f"{var}_spec_pred"].values
+        nyq = len(st) and int(d.sizes.get(d["lat"].dims[0], 128)) // 2
+        out[r] = {"RALSD": ralsd(st, sp), "k <= Nyquist": ralsd(st[:nyq + 1], sp[:nyq + 1]),
+                  "corner bins": ralsd(st[nyq + 1:], sp[nyq + 1:])}
+    return out
 
 
 def fig_distributions(diags: dict, var: str, colors: dict, save=None):
@@ -403,6 +426,28 @@ def fig_scorecard_strips(card, colors: dict, title: str = "", save=None):
     fig.legend(handles=handles, loc="outside lower left", ncols=len(handles))
     if title:
         fig.suptitle(title, x=0.0, ha="left", fontsize=11, color=INK)
+    _savefig(fig, save)
+    return fig
+
+
+def fig_training_curves(histories: dict, colors: dict, save=None):
+    """histories: run -> DataFrame(epoch, train_loss, val_loss); best epoch marked on the val panel."""
+    if not histories:
+        return None
+    fig, (a1, a2) = plt.subplots(1, 2, figsize=(10, 3.4), sharey=True, gridspec_kw={"wspace": 0.08})
+    for run, h in histories.items():
+        a1.plot(h.epoch + 1, h.train_loss, color=colors[run], label=run)
+        a2.plot(h.epoch + 1, h.val_loss, color=colors[run], label=run)
+        best = h.val_loss.idxmin()
+        a2.plot(h.epoch[best] + 1, h.val_loss[best], "o", color=colors[run], ms=6,
+                markeredgecolor=SURFACE, markeredgewidth=1.5)
+    for a, title in ((a1, "Training loss"), (a2, "Validation loss (dot = kept epoch)")):
+        a.set_yscale("log")
+        a.set_xscale("log")
+        a.set_xlabel("epoch")
+        a.set_title(title)
+    a1.set_ylabel("MSE (standardised units)")
+    a1.legend()
     _savefig(fig, save)
     return fig
 

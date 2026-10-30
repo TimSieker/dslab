@@ -21,6 +21,8 @@ def doy365(time: np.ndarray) -> np.ndarray:
 class Climatology(Downscaler):
     """Training-period mean for each calendar day, smoothed with a circular `window`-day running mean."""
 
+    summary = "mean of each calendar day over the training years (31-day smoothing); ignores the predictors"
+
     def __init__(self, variables, predictors, window: int = 31):
         super().__init__(variables, predictors, window=window)
         self.clim = None  # (365, V, H, W)

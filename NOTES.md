@@ -95,8 +95,95 @@ The target x/y (km) are an exact spherical Lambert conformal projection (fitted,
 `+proj=lcc +lat_0=49.5 +lon_0=10.5 +lat_1=49.5 +lat_2=49.5 +x_0=2825000 +y_0=2825000 +R=6371229`.
 Stored as `grid_crs` in the experiment YAML; the notebook draws maps in it (rectangular domain).
 
-### Open / next (awaiting the user)
+## 2026-10-30: first commit, kernel, Phase B (DeepESD, U-Net)
 
-1. Register the JupyterHub kernel: `bash env/install_kernel.sh` (writes `~/.local/share/jupyter/kernels/dslab`).
-2. Phase B: DeepESD and a small U-Net (GPU, ≈ 0.5 GPU-h), then flow-matching baselines (≈ 2–3 GPU-h).
-3. First git commit (repo initialised, nothing committed yet).
+User: "make the first git commit, then continue with the other steps".
+- Commit `483ca82` (Phase A), repo-local identity `b384340 <timsieker@gmail.com>` as in ~/cordex-ml-bench.
+- Kernel registered: `env/install_kernel.sh` → `~/.local/share/jupyter/kernels/dslab` (only that directory
+  added; sets PYTHONNOUSERSITE, LD_PRELOAD, HDF5_USE_FILE_LOCKING, PATH).
+
+### Phase B setup
+
+- `models/torch_base.py`: shared training for neural regressors: targets transformed (sqrt pr) and
+  standardised per grid point with training statistics, MSE, AdamW + ReduceLROnPlateau, early stopping on val
+  loss (best epoch kept), whole training split on the GPU, bf16 autocast; `state.pt` holds weights and
+  normalisation.
+- `deepesd`: CORDEX-ML-Bench reference CNN (conv 50-25-1 on the 16x16 grid + dense to 2x128x128), joint
+  pr/tasmax, 8.44 M parameters; original recipe (Adam 1e-4, batch 100, patience 30).
+- `unet`: residual U-Net (base 32, mults 1-2-4-8, 2 blocks/level, GroupNorm/SiLU), 9.84 M parameters,
+  14.2 GFLOP per forward pass (CorrDiff-TW1: 333). Input: 15 predictors bilinearly interpolated to the true
+  lat/lon of every target point (`grid_sample`, buffers stored in the model) + standardised orography.
+  The U-Net takes an optional time embedding (FiLM), to be reused as the flow-matching backbone in Phase C.
+- Jobs: `jobs/train.sbatch` (1 GPU, ≤ 1 h, fit + predict), `jobs/submit_model.sh` (train → evaluate chain).
+- Smoke test 28579769 (gpu-devel, A100-PCIE-40GB, 2 epochs each, val only): all steps OK; U-Net ≈ 12.5 s
+  per epoch, DeepESD < 0.5 s per epoch; 2 min 17 s wall (≈ 0.04 GPU-h). Smoke runs deleted afterwards.
+
+| job | what | resources | wall | notes |
+|---|---|---|---|---|
+| 28579769 | GPU smoke test | gpu-devel, 1 GPU | 2 min 17 s | |
+| 28579806 → 28579807 | DeepESD train+predict → evaluate | A100-SXM4-80GB → shared 16 CPUs | 3 min 09 s → 5 min 50 s | stopped at epoch 899, kept 869 (fit 112 s) |
+| 28579808 → 28579810 | U-Net train+predict → evaluate | A100-SXM4-80GB → shared 16 CPUs | 8 min 22 s → 6 min 49 s | stopped at epoch 35, kept 26 (fit 419 s, ~12 s/epoch) |
+| 28579811 + 3 reruns | notebook refresh | shared 8 CPUs | ~30 s each | |
+| | **Phase B GPU total** | | | **≈ 0.23 GPU-h** (incl. smoke test) |
+
+### Results, Phase B (ALPS ESD, perfect predictors)
+
+| split | model | pr RMSE | pr Mean Bias | pr SDII | pr Rx1day | pr RALSD | pr LHD | tx RMSE | tx Mean Bias | tx TXx | tx RALSD | tx PSS | tx IAV |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| hist 1981–2000 | linear | 4.42 | 0.45 | 2.99 | 20.6 | 10.0 | 5.22 | 1.55 | 0.10 | 0.65 | 3.97 | 0.978 | 0.114 |
+| | deepesd | 4.33 | 0.60 | 2.63 | 21.6 | 16.3 | 6.64 | 1.78 | 0.21 | 1.29 | 0.56 | 0.974 | 0.123 |
+| | unet | **3.75** | 0.43 | 1.27 | 12.0 | 19.7 | 3.18 | 1.40 | 0.24 | 0.70 | 13.1 | 0.979 | 0.098 |
+| | *DeepESD-IFCAv1-orog (pub.)* | 4.32 | 0.25 | 1.42 | 15.9 | 12.3 | 1.81 | 1.64 | 0.16 | 0.92 | 8.53 | 0.98 | 0.091 |
+| | *DetUNet-orog (pub.)* | 4.47 | 0.43 | 1.42 | 11.7 | 9.16 | 0.51 | 1.41 | 0.35 | 2.00 | 11.9 | 0.97 | 0.22 |
+| | *CorrDiff-TW1-orog (pub.)* | 3.77 | 0.62 | 1.88 | 17.5 | 3.78 | 2.03 | 2.58 | 2.10 | 2.77 | 0.24 | 0.89 | 0.13 |
+| future (pooled) | deepesd | 4.74 | 0.63 | 3.00 | 25.5 | 17.4 | 8.81 | 1.88 | 0.26 | 2.10 | 1.12 | 0.967 | 0.079 |
+| | unet | **4.15** | 0.46 | 1.45 | 14.4 | 21.3 | 4.13 | 1.59 | 0.46 | 2.24 | 9.15 | 0.951 | 0.103 |
+| | *CorrDiff-TW1-orog (pub.)* | 4.14 | 0.67 | 2.16 | 20.0 | 4.54 | 2.07 | 2.83 | 2.44 | 3.63 | 0.34 | 0.86 | 0.11 |
+
+Observations:
+- **DeepESD replicates the published entry on RMSE** (pr 4.33 vs 4.32 hist, 4.74 vs 4.72 future); other
+  scores differ (pr bias/SDII/LHD worse, tasmax RALSD much better) — loss / normalisation choices (ours: MSE on
+  per-grid-point standardised sqrt(pr), joint pr+tasmax) vs. theirs (unknown in detail).
+- **U-Net is the best regression model so far**: pr RMSE 3.75 is the third lowest of the 40 published ALPS ESD
+  entries (Prithvi-UNet-orog 3.63, RCMGEM-mv-orog 3.74; CorrDiff-TW1 3.77); tasmax RMSE 1.40 vs. published best
+  1.26 (RCMGEM), 1.30 (RCMFlow). *(Corrected 2026-10-30: an earlier version said "lowest of all published
+  entries" after comparing against a shortlist only.)* It overfits quickly (train MSE 0.05 vs val 0.15 at stop) → room for regularisation
+  / augmentation. Extrapolation of hot extremes is weaker than linear (future TXx bias 2.24 vs 1.11 K; mean bias
+  0.46 vs 0.34 K): the non-linear model saturates outside the training climate.
+- **RALSD is dominated by pixel-scale texture.** The published RALSD averages 90 radial bins of which 25 lie
+  beyond the Nyquist wavenumber (grid-diagonal "corners"). Up to Nyquist the U-Net has the best spectra
+  (tasmax 0.58, pr 9.7 dB²) but it loses 6–8 dB in the corner bins (45 dB² there), hence total 13.1 / 19.7.
+  DeepESD's per-grid-point dense layer gives slightly too much corner power (+1–2 dB). The notebook now shows
+  the full spectrum with the corner range shaded and a RALSD split table. Relevant for generative models: the
+  metric rewards correct grid-scale texture.
+- All deterministic models are 3–4 dB too smooth at 30–100 km for pr and underestimate extremes; that is the
+  gap the generative models (Phase C) should close.
+
+### Notebook: metric guide, captions, findings (user request)
+
+The notebook now has a data/splits section, a "Metrics in brief" table (definition, units, ideal value, published
+ALPS ESD range, interpretation), a caption at the top of every figure/table cell generated from the experiment
+config (`results.caption`: what is shown, trained on, model selection on, evaluated on, runs) and a dated findings
+note after each figure (snapshot 2026-10-30, to be updated when runs change), plus a rank table "number of
+published entries that score better". Every number in the findings was checked against the stored diagnostics.
+
+New finding while writing them: **all trained models are ~15% too dry** (domain-mean pr bias −0.39 to −0.55 mm/day
+of 3.0; every month, strongest in autumn and over high terrain). Likely cause: MSE on sqrt(pr) estimates
+E[sqrt(pr)], and squaring underestimates E[pr] (Jensen). Climatology (raw pr) has none. Candidate fixes: train on
+raw pr / log1p with a variance correction, or generative models.
+
+### Notebook: experiments introduced (user request)
+
+New "Experiments" section: the two CORDEX-ML-Bench experiments (ESD pseudo-reality vs. Emulator; training periods,
+tests, perfect/imperfect predictors, cross-validation/extrapolation/interpolation, GCM transferability, which tests
+enter the published scorecard) with a config-generated status table (`results.benchmark_tests`), and the model
+runs as a method ladder (what each model is, input → output, training cost, why it is on the ladder) with a
+generated table (`results.run_info`, model `summary` attributes). All official tests are now configured in both
+experiment YAMLs (`benchmark_tests`; ESD Tests 2, 4, 5 and Emulator Tests 2–6 not evaluated yet); `default_splits`
+unchanged, so nothing new is predicted by default.
+
+### Next (awaiting the user)
+
+Phase C: conditional flow matching with the same U-Net backbone (time-conditioned `UNet`, already in
+`networks.py`), (a) plain, (b) residual on top of the `unet` run (CorrDiff-style); ensembles of 10 members.
+Estimate ≈ 1–1.5 GPU-h training + ≈ 0.5 GPU-h sampling per variant (to be measured on gpu-devel first).

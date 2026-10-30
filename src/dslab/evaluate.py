@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import time
+import warnings
 
 import numpy as np
 import pandas as pd
@@ -78,7 +79,9 @@ def variable_scores(var: str, pred: np.ndarray, truth: np.ndarray, time: np.ndar
         indices = {"TXx": lambda a: M.annual_max_mean(a, years)}
     for name, fn in indices.items():
         true_map = fn(truth)
-        bias = np.nanmean([fn(m) - true_map for m in idx_members], axis=0)
+        with warnings.catch_warnings():  # grid points never wet in any member stay NaN (dropped later)
+            warnings.simplefilter("ignore", RuntimeWarning)
+            bias = np.nanmean([fn(m) - true_map for m in idx_members], axis=0)
         d[f"{name}_true"], d[f"{name}_bias"] = true_map, bias
         s[name] = M.rms_space(bias)
     if var == "tasmax":  # IAV on one member

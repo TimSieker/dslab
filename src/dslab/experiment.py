@@ -41,6 +41,8 @@ class Experiment:
     default_eval_splits: tuple[str, ...]
     reference: dict  # published scorecard to compare against: experiment, domain, split -> triangle
     grid_crs: dict | None  # projection of the target grid (for maps); None = regular lat/lon
+    truth: str  # description of the target data, for figure captions
+    benchmark_tests: tuple[dict, ...]  # official tests: {test, name, split}
 
     @classmethod
     def load(cls, name_or_path: str | Path) -> Experiment:
@@ -70,6 +72,8 @@ class Experiment:
             default_eval_splits=tuple(cfg.get("default_eval_splits", cfg["default_splits"])),
             reference=cfg.get("reference") or {},
             grid_crs=cfg.get("grid_crs"),
+            truth=cfg.get("truth", "target data"),
+            benchmark_tests=tuple(cfg.get("benchmark_tests") or ()),
         )
 
     @property

@@ -1,0 +1,13 @@
+# Small residual U-Net on the 128x128 target grid; input = 15 predictors interpolated to the target
+# points + orography. MSE on standardised sqrt(pr) / tasmax, bf16 autocast. 1 GPU, ~10-20 min.
+model: unet
+params:
+  transform: {pr: sqrt}
+  base: 32
+  mults: [1, 2, 4, 8]
+  blocks: 2
+  lr: 3.0e-4
+  weight_decay: 1.0e-4
+  batch_size: 16
+  max_epochs: 60
+  patience: 8

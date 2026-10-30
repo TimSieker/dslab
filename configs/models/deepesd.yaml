@@ -1,0 +1,10 @@
+# DeepESD (CORDEX-ML-Bench reference CNN), joint pr + tasmax, MSE on standardised sqrt(pr) / tasmax.
+# Original recipe: Adam lr 1e-4, batch 100, early stopping (patience 30). 1 GPU, a few minutes.
+model: deepesd
+params:
+  transform: {pr: sqrt}
+  filters: [50, 25, 1]
+  lr: 1.0e-4
+  batch_size: 100
+  max_epochs: 2000
+  patience: 30

@@ -19,6 +19,8 @@ from .base import Downscaler, register
 
 @register("linear")
 class LinearRidge(Downscaler):
+    summary = "ridge regression of every target grid point on the leading principal components of the predictors"
+
     def __init__(self, variables, predictors, transform=None,
                  n_pcs=(50, 100, 200, 400, 800, 1600, 3840), alphas=(0.0, 1e1, 1e2, 1e3, 1e4, 1e5)):
         super().__init__(variables, predictors, transform=dict(transform or {}),

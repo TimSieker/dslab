@@ -44,7 +44,9 @@ sbatch jobs/notebook.sbatch                        # execute notebooks/evaluatio
 
 Splits: `train` / `val` (training file without / with only the `val_years`), the test splits listed in the
 experiment YAML, and evaluation-only `combined_splits` (ESD future = 2041–2060 + 2080–2099, as scored by the
-benchmark). Another experiment = another YAML in `configs/experiments/`; nothing else changes.
+benchmark). `benchmark_tests` maps each official CORDEX-ML-Bench test to the split implementing it (all tests of
+both experiments are configured; `default_splits` decides what is predicted by default). Another experiment =
+another YAML in `configs/experiments/`; nothing else changes.
 
 ## Where to run what (DKRZ Levante)
 

@@ -4,6 +4,7 @@
 name: alps_emulator
 domain: ALPS
 description: Emulator hist+future, ALPS, CNRM-CM5-driven ALADIN63, train 1961-1980 + 2080-2099
+truth: CNRM-CM5-driven ALADIN63 regional climate model, 12.5 km  # what the targets are (for captions)
 data_root: /work/bb1596/b384340/cordex-ml-bench/data/benchmark/ALPS_domain
 variables: [pr, tasmax]
 predictors: [u_850, u_700, u_500, v_850, v_700, v_500, t_850, t_700, t_500,
@@ -21,20 +22,40 @@ train:
 val_years: [1967, 1975, 2087, 2095]
 
 tests:
+  # Test 1: perfect cross-validation (historical)
   historical_perfect:
     predictors: test/historical/predictors/perfect/CNRM-CM5_1981-2000.nc
     target: test/historical/target/pr_tasmax_CNRM-CM5_1981-2000.nc
-  mid_century_perfect:
-    predictors: test/mid_century/predictors/perfect/CNRM-CM5_2041-2060.nc
-    target: test/mid_century/target/pr_tasmax_CNRM-CM5_2041-2060.nc
+  # Test 2: imperfect cross-validation
   historical_imperfect:
     predictors: test/historical/predictors/imperfect/CNRM-CM5_1981-2000.nc
     target: test/historical/target/pr_tasmax_CNRM-CM5_1981-2000.nc
+  # Test 3: perfect interpolation (2041-2060, same GCM)
+  mid_century_perfect:
+    predictors: test/mid_century/predictors/perfect/CNRM-CM5_2041-2060.nc
+    target: test/mid_century/target/pr_tasmax_CNRM-CM5_2041-2060.nc
+  # Test 4: imperfect interpolation
+  mid_century_imperfect:
+    predictors: test/mid_century/predictors/imperfect/CNRM-CM5_2041-2060.nc
+    target: test/mid_century/target/pr_tasmax_CNRM-CM5_2041-2060.nc
+  # Test 5 / 6: perfect / imperfect interpolation, GCM transferability (RCM driven by MPI-ESM-LR)
   mid_century_perfect_MPI-ESM-LR:
     predictors: test/mid_century/predictors/perfect/MPI-ESM-LR_2041-2060.nc
     target: test/mid_century/target/pr_tasmax_MPI-ESM-LR_2041-2060.nc
+  mid_century_imperfect_MPI-ESM-LR:
+    predictors: test/mid_century/predictors/imperfect/MPI-ESM-LR_2041-2060.nc
+    target: test/mid_century/target/pr_tasmax_MPI-ESM-LR_2041-2060.nc
 
 combined_splits: {}
+
+benchmark_tests:
+  - {test: Test 1, name: perfect cross-validation, split: historical_perfect}
+  - {test: Test 2, name: imperfect cross-validation, split: historical_imperfect}
+  - {test: Test 3, name: perfect interpolation, split: mid_century_perfect}
+  - {test: Test 4, name: imperfect interpolation, split: mid_century_imperfect}
+  - {test: Test 5, name: perfect interpolation (GCM transferability), split: mid_century_perfect_MPI-ESM-LR}
+  - {test: Test 6, name: imperfect interpolation (GCM transferability), split: mid_century_imperfect_MPI-ESM-LR}
+
 default_splits: [val, historical_perfect, mid_century_perfect]
 default_eval_splits: [val, historical_perfect, mid_century_perfect]
 reference:

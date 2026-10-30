@@ -4,6 +4,7 @@
 name: alps_esd
 domain: ALPS
 description: ESD pseudo-reality, ALPS, CNRM-CM5-driven ALADIN63, train 1961-1980
+truth: CNRM-CM5-driven ALADIN63 regional climate model, 12.5 km  # what the targets are (for captions)
 data_root: /work/bb1596/b384340/cordex-ml-bench/data/benchmark/ALPS_domain
 variables: [pr, tasmax]
 predictors: [u_850, u_700, u_500, v_850, v_700, v_500, t_850, t_700, t_500,
@@ -21,26 +22,50 @@ train:
 val_years: [1967, 1975]
 
 tests:
-  # Test1: perfect cross-validation (historical)
+  # Test 1: perfect cross-validation (historical)
   historical_perfect:
     predictors: test/historical/predictors/perfect/CNRM-CM5_1981-2000.nc
     target: test/historical/target/pr_tasmax_CNRM-CM5_1981-2000.nc
-  # Test3: perfect extrapolation (future, same GCM)
+  # Test 2: imperfect cross-validation (GCM predictors)
+  historical_imperfect:
+    predictors: test/historical/predictors/imperfect/CNRM-CM5_1981-2000.nc
+    target: test/historical/target/pr_tasmax_CNRM-CM5_1981-2000.nc
+  # Test 3: perfect extrapolation (future, same GCM)
   mid_century_perfect:
     predictors: test/mid_century/predictors/perfect/CNRM-CM5_2041-2060.nc
     target: test/mid_century/target/pr_tasmax_CNRM-CM5_2041-2060.nc
   end_century_perfect:
     predictors: test/end_century/predictors/perfect/CNRM-CM5_2080-2099.nc
     target: test/end_century/target/pr_tasmax_CNRM-CM5_2080-2099.nc
-  # Test2: imperfect cross-validation (GCM predictors)
-  historical_imperfect:
-    predictors: test/historical/predictors/imperfect/CNRM-CM5_1981-2000.nc
-    target: test/historical/target/pr_tasmax_CNRM-CM5_1981-2000.nc
+  # Test 4: imperfect extrapolation
+  mid_century_imperfect:
+    predictors: test/mid_century/predictors/imperfect/CNRM-CM5_2041-2060.nc
+    target: test/mid_century/target/pr_tasmax_CNRM-CM5_2041-2060.nc
+  end_century_imperfect:
+    predictors: test/end_century/predictors/imperfect/CNRM-CM5_2080-2099.nc
+    target: test/end_century/target/pr_tasmax_CNRM-CM5_2080-2099.nc
+  # Test 5: perfect extrapolation, GCM transferability (RCM driven by MPI-ESM-LR)
+  mid_century_perfect_MPI-ESM-LR:
+    predictors: test/mid_century/predictors/perfect/MPI-ESM-LR_2041-2060.nc
+    target: test/mid_century/target/pr_tasmax_MPI-ESM-LR_2041-2060.nc
+  end_century_perfect_MPI-ESM-LR:
+    predictors: test/end_century/predictors/perfect/MPI-ESM-LR_2080-2099.nc
+    target: test/end_century/target/pr_tasmax_MPI-ESM-LR_2080-2099.nc
 
 # Evaluation-only splits made by concatenating test splits along time. The published ESD "future"
 # scores pool 2041-2060 and 2080-2099 (docs/metric_definitions.md).
 combined_splits:
   mid_end_century_perfect: [mid_century_perfect, end_century_perfect]
+  mid_end_century_imperfect: [mid_century_imperfect, end_century_imperfect]
+  mid_end_century_perfect_MPI-ESM-LR: [mid_century_perfect_MPI-ESM-LR, end_century_perfect_MPI-ESM-LR]
+
+# The benchmark's tests for this experiment (ml-benchmark README) and the split implementing each.
+benchmark_tests:
+  - {test: Test 1, name: perfect cross-validation, split: historical_perfect}
+  - {test: Test 2, name: imperfect cross-validation, split: historical_imperfect}
+  - {test: Test 3, name: perfect extrapolation, split: mid_end_century_perfect}
+  - {test: Test 4, name: imperfect extrapolation, split: mid_end_century_imperfect}
+  - {test: Test 5, name: perfect extrapolation (GCM transferability), split: mid_end_century_perfect_MPI-ESM-LR}
 
 # Splits that scripts predict / evaluate when none are given on the command line.
 default_splits: [val, historical_perfect, mid_century_perfect, end_century_perfect]

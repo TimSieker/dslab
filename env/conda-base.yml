@@ -1,0 +1,28 @@
+# Input spec for the conda part of the environment (unpinned request).
+# The fully pinned, reproducible spec is ../environment.yml (written by build_env.sh after install).
+name: dslab
+channels:
+  - conda-forge
+dependencies:
+  - python=3.12
+  - pip
+  - numpy<2.4
+  - xarray
+  - netcdf4
+  - h5netcdf
+  - cftime
+  - dask-core
+  - scipy
+  - pandas
+  - scikit-learn
+  - matplotlib-base
+  - cartopy
+  - tqdm
+  - pyyaml
+  - pytest
+  # notebooks: kernel for JupyterHub + headless execution
+  - ipykernel
+  - nbformat
+  - nbclient
+  - nbconvert
+  - ipywidgets

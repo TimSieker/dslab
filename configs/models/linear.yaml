@@ -1,0 +1,8 @@
+# Ridge regression on leading predictor PCs, every target grid point. CPU, ~1-2 min.
+# n_pcs and alphas are candidate lists; the best pair per variable is chosen on the val split.
+# 3840 = all PCs (15 predictors x 16 x 16), i.e. plain ridge regression.
+model: linear
+params:
+  transform: {pr: sqrt}
+  n_pcs: [50, 100, 200, 400, 800, 1600, 3840]
+  alphas: [0.0, 1.0e+1, 1.0e+2, 1.0e+3, 1.0e+4, 1.0e+5]

@@ -1,0 +1,53 @@
+# CORDEX-ML-Bench Experiment 1 "ESD pseudo-reality", ALPS domain.
+# Train on perfect (RCM-upscaled) predictors 1961-1980; held-out years are used for model selection.
+# Paths are relative to data_root. Test split names follow <period>_<predictor type>[_<gcm>].
+name: alps_esd
+domain: ALPS
+description: ESD pseudo-reality, ALPS, CNRM-CM5-driven ALADIN63, train 1961-1980
+data_root: /work/bb1596/b384340/cordex-ml-bench/data/benchmark/ALPS_domain
+variables: [pr, tasmax]
+predictors: [u_850, u_700, u_500, v_850, v_700, v_500, t_850, t_700, t_500,
+             z_850, z_700, z_500, q_850, q_700, q_500]
+static: train/ESD_pseudo_reality/predictors/Static_fields.nc
+
+# Projection of the target grid (fitted to the files' x/y vs lat/lon, max error 1 mm): ALADIN63
+# Lambert conformal on a sphere. Used for maps; omit for regular lat/lon target grids.
+grid_crs: {proj: lcc, lat_0: 49.5, lon_0: 10.5, lat_1: 49.5, lat_2: 49.5, x_0: 2825000, y_0: 2825000,
+           R: 6371229, coord_units: km}
+
+train:
+  predictors: train/ESD_pseudo_reality/predictors/CNRM-CM5_1961-1980.nc
+  target: train/ESD_pseudo_reality/target/pr_tasmax_CNRM-CM5_1961-1980.nc
+val_years: [1967, 1975]
+
+tests:
+  # Test1: perfect cross-validation (historical)
+  historical_perfect:
+    predictors: test/historical/predictors/perfect/CNRM-CM5_1981-2000.nc
+    target: test/historical/target/pr_tasmax_CNRM-CM5_1981-2000.nc
+  # Test3: perfect extrapolation (future, same GCM)
+  mid_century_perfect:
+    predictors: test/mid_century/predictors/perfect/CNRM-CM5_2041-2060.nc
+    target: test/mid_century/target/pr_tasmax_CNRM-CM5_2041-2060.nc
+  end_century_perfect:
+    predictors: test/end_century/predictors/perfect/CNRM-CM5_2080-2099.nc
+    target: test/end_century/target/pr_tasmax_CNRM-CM5_2080-2099.nc
+  # Test2: imperfect cross-validation (GCM predictors)
+  historical_imperfect:
+    predictors: test/historical/predictors/imperfect/CNRM-CM5_1981-2000.nc
+    target: test/historical/target/pr_tasmax_CNRM-CM5_1981-2000.nc
+
+# Evaluation-only splits made by concatenating test splits along time. The published ESD "future"
+# scores pool 2041-2060 and 2080-2099 (docs/metric_definitions.md).
+combined_splits:
+  mid_end_century_perfect: [mid_century_perfect, end_century_perfect]
+
+# Splits that scripts predict / evaluate when none are given on the command line.
+default_splits: [val, historical_perfect, mid_century_perfect, end_century_perfect]
+default_eval_splits: [val, historical_perfect, mid_century_perfect, end_century_perfect, mid_end_century_perfect]
+
+# Published scorecards (supplement S12/S13, docs/reference/) to compare against.
+reference:
+  experiment: ESD_pseudo_reality
+  domain: ALPS
+  splits: {historical_perfect: upper_left, mid_end_century_perfect: lower_right}

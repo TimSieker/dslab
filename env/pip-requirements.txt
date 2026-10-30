@@ -1,0 +1,7 @@
+# Step 2 of the env build (after conda-base.yml and the torch CUDA wheels). Unpinned request;
+# the resolved, pinned set is recorded in ../environment.yml.
+# Organisers' evaluation suite (used to cross-check our metric implementations), pinned to the
+# commit used in ~/cordex-ml-bench/repos/cordex-bench-eval
+cordex-bench-eval @ git+https://github.com/jgonzalezab/cordex-bench-eval@0fd7df6f2b52439704d85d28a74d1e15aa9df1c1
+# this project, editable
+-e .

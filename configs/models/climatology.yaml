@@ -1,0 +1,4 @@
+# Smoothed day-of-year climatology of the training targets (ignores predictors). CPU, seconds.
+model: climatology
+params:
+  window: 31

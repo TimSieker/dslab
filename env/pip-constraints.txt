@@ -1,0 +1,3 @@
+# Keep the CUDA build of torch installed in step 1 from being replaced by PyPI resolution in step 2.
+torch==2.10.0
+numpy<2.4

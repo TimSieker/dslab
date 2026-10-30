@@ -1,0 +1,12 @@
+# Code lives here (HOME, backed up). Cache, runs, predictions, evaluation outputs live on WORK:
+#   /work/bb1596/b384340/downscaling-lab  (symlinked as ./work); the conda env is ~/envs/dslab
+work
+*.nc
+*.npy
+*.npz
+*.pt
+__pycache__/
+*.pyc
+*.egg-info/
+.ipynb_checkpoints/
+.pytest_cache/

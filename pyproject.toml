@@ -1,0 +1,20 @@
+[project]
+name = "dslab"
+version = "0.1.0"
+description = "Lightweight statistical / ML downscaling experiments on CORDEX-ML-Bench data"
+requires-python = ">=3.11"
+# Dependencies are provided by the conda environment (env/conda-base.yml, environment.yml).
+dependencies = []
+
+[project.scripts]
+dslab = "dslab.cli:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

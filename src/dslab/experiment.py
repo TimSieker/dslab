@@ -43,6 +43,7 @@ class Experiment:
     grid_crs: dict | None  # projection of the target grid (for maps); None = regular lat/lon
     truth: str  # description of the target data, for figure captions
     benchmark_tests: tuple[dict, ...]  # official tests: {test, name, split}
+    extra: dict | None = None  # extra RCM fields (DKRZ CORDEX pool): root, run, window, periods
 
     @classmethod
     def load(cls, name_or_path: str | Path) -> Experiment:
@@ -74,6 +75,7 @@ class Experiment:
             grid_crs=cfg.get("grid_crs"),
             truth=cfg.get("truth", "target data"),
             benchmark_tests=tuple(cfg.get("benchmark_tests") or ()),
+            extra=cfg.get("extra"),
         )
 
     @property

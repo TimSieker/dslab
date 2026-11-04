@@ -4,6 +4,8 @@
     dslab fit      --exp alps_esd --model linear          # -> work/runs/alps_esd/linear/
     dslab predict  --exp alps_esd --run linear            # -> work/predictions/alps_esd/linear/<split>.nc
     dslab evaluate --exp alps_esd --run linear            # -> work/eval/alps_esd/linear/<split>/
+    dslab laws     --exp alps_esd                         # -> work/eval/alps_esd/laws/diagnostics.nc
+    dslab extract  --exp alps_esd                         # -> work/cache/ALPS/extra/<period>/<field>.npy
 
 --model takes a name in configs/models/ or a YAML path; --set overrides params (--set window=15).
 Splits default to the experiment's default_splits.
@@ -98,17 +100,22 @@ def cmd_predict(args):
     exp = Experiment.load(args.exp)
     run_dir = exp.runs_dir / args.run
     model = Downscaler.load(run_dir)
+    name = args.name or (f"{args.run}-base" if args.base_only else args.run)
+    if args.base_only:  # flow-matching runs: the base draws x0 alone, without the flow
+        model.params["base_only"] = True
     grid = load_grid(exp)
-    members = args.members or model.params.get("n_members", 10 if model.stochastic else 1)
     for split in args.splits or exp.default_splits:
+        members = (args.members or model.params.get("members_per_split", {}).get(split)
+                   or model.params.get("n_members", 10 if model.stochastic else 1))
         t0 = time.time()
         s = load_split(exp, split)
         pred = model.predict(s, grid, n_members=members, seed=args.seed)
-        out = exp.predictions_dir / args.run / f"{split}.nc"
-        attrs = {"experiment": exp.name, "run": args.run, "model": model.name, "split": split,
-                 "n_members": pred.shape[0], **{k: str(v) for k, v in provenance().items()}}
+        out = exp.predictions_dir / name / f"{split}.nc"
+        attrs = {"experiment": exp.name, "run": name, "model": model.name, "split": split,
+                 "n_members": pred.shape[0], "base_only": int(bool(args.base_only)), "source_run": args.run,
+                 **{k: str(v) for k, v in provenance().items()}}
         write_prediction(out, pred, s, grid, attrs)
-        print(f"[predict] {args.run} {split}: {pred.shape} in {time.time() - t0:.1f} s -> {out}", flush=True)
+        print(f"[predict] {name} {split}: {pred.shape} in {time.time() - t0:.1f} s -> {out}", flush=True)
 
 
 def cmd_evaluate(args):
@@ -119,6 +126,30 @@ def cmd_evaluate(args):
     for run in runs:
         for split in args.splits or exp.default_eval_splits:
             evaluate_run(exp, run, split, overwrite=args.overwrite)
+
+
+def cmd_extract(args):
+    from .extra import FIELDS, extract, extract_gcm
+
+    if args.gcm:
+        extract_gcm(Experiment.load(args.exp), args.periods)
+    else:
+        extract(Experiment.load(args.exp), args.periods, args.fields or FIELDS, args.workers)
+
+
+def cmd_laws(args):
+    if args.primitive:
+        from .primitive import save
+
+        save(Experiment.load(args.exp))
+    elif args.candidates:
+        from .candidate_laws import run
+
+        run(Experiment.load(args.exp), args.names, args.splits)
+    else:
+        from .law_diagnostics import run
+
+        run(Experiment.load(args.exp), args.splits, args.ref_run)
 
 
 def main(argv=None):
@@ -145,6 +176,9 @@ def main(argv=None):
     sp.add_argument("--splits", nargs="*")
     sp.add_argument("--members", type=int, help="ensemble size (default: the model's n_members, 1 if deterministic)")
     sp.add_argument("--seed", type=int, default=0)
+    sp.add_argument("--base-only", action="store_true",
+                    help="flow-matching runs: write the base draws x0 (no flow), as run <run>-base")
+    sp.add_argument("--name", help="name of the prediction set (default: the run name)")
     sp.set_defaults(func=cmd_predict)
 
     sp = sub.add_parser("evaluate", help="compute metrics for predictions")
@@ -153,6 +187,25 @@ def main(argv=None):
     sp.add_argument("--splits", nargs="*")
     sp.add_argument("--overwrite", action="store_true")
     sp.set_defaults(func=cmd_evaluate)
+
+    sp = sub.add_parser("extract", help="cut extra RCM fields from the DKRZ CORDEX pool to the benchmark window")
+    sp.add_argument("--exp", required=True)
+    sp.add_argument("--periods", nargs="*", help="default: all periods in the experiment's extra: section")
+    sp.add_argument("--fields", nargs="*", help="default: all (see dslab.extra)")
+    sp.add_argument("--workers", type=int, default=8)
+    sp.add_argument("--gcm", action="store_true", help="the driving GCM's daily fields on the 2° grid instead")
+    sp.set_defaults(func=cmd_extract)
+
+    sp = sub.add_parser("laws", help="how well the LC-AFM laws hold on the truth (-> eval/<exp>/laws/diagnostics.nc)")
+    sp.add_argument("--exp", required=True)
+    sp.add_argument("--splits", nargs="*", help="default: train, val and the perfect/imperfect test splits")
+    sp.add_argument("--ref-run", default="afm", help="(LC-)AFM run whose sigma_max sets the prior noise")
+    sp.add_argument("--candidates", action="store_true",
+                    help="test the candidate laws of dslab.candidate_laws instead (-> laws/candidates.nc)")
+    sp.add_argument("--names", nargs="*", help="candidate laws to test (default: all)")
+    sp.add_argument("--primitive", action="store_true",
+                    help="evaluate the primitive equations on the daily 2° predictors (-> laws/primitive.csv)")
+    sp.set_defaults(func=cmd_laws)
 
     args = p.parse_args(argv)
     np.set_printoptions(precision=4, suppress=True)

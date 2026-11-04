@@ -1,13 +1,13 @@
 """Generates notebooks/evaluation.ipynb (cells, captions, findings notes); run with the dslab env:
     python notebooks/build_evaluation_notebook.py
-Version prepared 2026-10-30 for Phase C (runs unet + afm, findings marked pending). NOT yet applied: the committed
-notebook still shows the four Phase B runs. Apply it once the afm run is evaluated, then rewrite the findings notes.
+then execute it (sbatch jobs/notebook.sbatch). The findings notes hold numbers checked against scores.json /
+diagnostics.nc of the runs named in SNAP; rewrite them when runs change.
 """
 import nbformat as nbf
 
 md, code = nbf.v4.new_markdown_cell, nbf.v4.new_code_cell
 cells = []
-SNAP = "**Findings** *(snapshot 2026-10-30, runs: climatology, deepesd, linear, unet; update when runs change)*"
+SNAP = "**Findings** *(snapshot 2026-11-02, runs: unet, afm; update when runs change)*"
 
 cells.append(md("""# Downscaling lab: evaluation
 
@@ -96,6 +96,29 @@ The table below is generated from the experiment configuration: it lists this ex
 implements each, and which runs have been evaluated on it so far."""))
 cells.append(code("""display(Markdown(f"**{EXP.name}**: {EXP.description}. Truth: {EXP.truth}."))
 results.benchmark_tests(EXP, RUNS)"""))
+
+cells.append(md("""### Predictors and downscaled variables
+
+Every model learns one mapping, from the **predictors** to the **target variables**:
+
+* **Predictors (input):** 15 daily fields on the coarse grid, five atmospheric quantities at three pressure levels.
+  Wind (u, v) and geopotential height (z) describe the circulation; temperature (t) and specific humidity (q)
+  describe the air mass. In the *perfect* tests they are the RCM's own fields regridded to the 2° grid, in the
+  *imperfect* tests the same fields from the driving GCM.
+* **Static field (input):** orography on the target grid, which carries the terrain detail the coarse grid cannot
+  resolve.
+* **Target variables (downscaled output):** daily precipitation (`pr`) and daily maximum near-surface temperature
+  (`tasmax`) on the RCM grid. All scores and figures in this notebook refer to these two variables.
+
+The table is read from the experiment configuration and the training files."""))
+cells.append(code("""results.variables_table(EXP)"""))
+cells.append(md("""How the two runs use them (both predict `pr` and `tasmax` jointly, one field each per day; predictions are
+converted back to mm/day and K before evaluation):
+
+| run | input channels on the 128 × 128 grid | targets as seen in training |
+|---|---|---|
+| `unet` | 16: the 15 predictors (standardised per channel and coarse grid point, bilinearly interpolated to the target grid points) + orography (standardised) | sqrt(pr) and tasmax, each standardised per grid point |
+| `afm` | 17: the same 15 interpolated predictors + orography + latitude of each grid point (both standardised; latitude comes from the grid coordinates, not from a data file) | raw pr and tasmax, each z-scored with one mean and standard deviation per variable |"""))
 cells.append(md("""Training and model selection use only the training file, never a test set:"""))
 cells.append(code("""display(Markdown("\\n".join(f"- {results.describe_split(EXP, s)}" for s in ["train", "val"])))"""))
 
@@ -110,7 +133,7 @@ disk for reference; their results are in `NOTES.md` and the git history of this 
 | run | what it is | input → output | training (here) | why it is on the ladder |
 |---|---|---|---|---|
 | `unet` | residual U-Net (9.8 M parameters) on the target grid; predictors interpolated to every grid point, orography added | 16 × 128 × 128 → 2 × 128 × 128, one field per day | MSE on per-grid-point standardised sqrt(pr), tasmax; early stopping on `val`; 1 A100, 7 min | deterministic baseline: the conditional mean |
-| `afm` | encoder *E* (SongUNet-L) gives a first estimate; a denoiser *D* (SongUNet-L) turns *E* + noise into a sample by integrating a learned flow in 50 steps; the noise scale per variable adapts to the encoder's error | 17 × 128 × 128 (predictors, orography, latitude) → 12 members × 2 × 128 × 128 | flow-matching loss + 0.25 × encoder MSE (paper Eq. 3) on z-scored raw pr, tasmax; checkpoint selection on `val` | generative: realistic texture, extremes and calibrated ensembles |
+| `afm` | encoder *E* (SongUNet-L) gives a first estimate; a denoiser *D* (SongUNet-L) turns *E* + noise into a sample by integrating a learned flow in 50 steps; the noise scale per variable adapts to the encoder's error (23.8 M parameters in total) | 17 × 128 × 128 (predictors, orography, latitude) → 12 members × 2 × 128 × 128 (5 members for the two future periods) | flow-matching loss + 0.25 × encoder MSE (paper Eq. 3) on z-scored raw pr, tasmax; 2 M samples, checkpoint selection on `val`; 1 A100, 2.2 h (+ 1.3 h sampling) | generative: realistic texture, extremes and calibrated ensembles |
 
 **AFM in a nutshell.** Training draws a time *t* ∈ [0, 1] and builds a noisy state between the encoder estimate and
 the truth, x_t = (1 − t)·E + t·x₁ + σ_t·ε with σ_t = (1 − t)·σ_max; the denoiser learns to recover x₁ from x_t. At
@@ -167,13 +190,16 @@ cap("training curves of the neural runs, one panel per run: training loss (grey)
     "targets; AFM: L_AFM + 0.25 L_enc (validation with fixed noise draws, EMA weights).", "val")
 P.fig_training_curves(hist, COLORS, save=save("training_curves")) if hist else print("no neural runs yet");"""))
 cells.append(md(f"""{SNAP}
-- **DeepESD** (8.4 M parameters) converges slowly but steadily; training and validation loss stay close (0.176 vs.
-  0.201 at the kept epoch 869 of 900): no overfitting. Early stopping ended it while it was still improving very
-  slightly.
-- **U-Net** (9.8 M parameters) reaches a much lower validation loss within a few epochs (0.153 at epoch 26), then
-  overfits: training loss keeps falling (0.048) while validation loss rises. Early stopping keeps the epoch-26
-  weights; more regularisation (dropout, weight decay, augmentation) or a smaller network may help.
-- Both losses are on the same standardised targets, so the U-Net's validation loss is about 25% lower than DeepESD's."""))
+- **U-Net** (9.8 M parameters) reaches its lowest validation loss after 26 passes (0.153), then overfits: training
+  loss keeps falling (0.048) while validation loss rises. Early stopping keeps the epoch-26 weights.
+- **AFM** (23.8 M parameters) trained on 2.0 M samples, i.e. 304 passes over the 6,575 training days, in 2.2 h on
+  one A100. Validation loss is lowest after 1.1 M samples (167 passes; 0.522), then rises to 0.553 while training
+  loss keeps falling (0.505 → 0.452): the denoiser overfits the 18 training years. The rise is entirely in the
+  flow-matching term (0.458 → 0.498); the encoder term keeps improving. The 1.1 M checkpoint is the one kept, so
+  longer training would not help without more data or regularisation.
+- The adaptive noise scale σ_max fell from its start value 1 to 0.64 (pr) and 0.29 (tasmax) in standardised units
+  at the kept checkpoint: the encoder leaves about twice as much unexplained variability for precipitation.
+- The two panels show different losses; their values cannot be compared."""))
 
 # 2. Scorecard
 cells.append(md("""## 2. Scorecard against the published entries
@@ -199,15 +225,18 @@ plt.show()
 display(show_card(results.scorecard(EXP, SPLIT, RUNS, REF_MODELS, scores=scores)))
 display(results.rank_vs_published(card).style.set_caption("number of published entries that score better"))"""))
 cells.append(md(f"""{SNAP} — historical test period
-- The **U-Net** is our best model on 8 of 12 metrics. Its pr RMSE (3.75 mm/day) is the third lowest of the 40
-  published entries (only Prithvi-UNet-orog 3.63 and RCMGEM-mv-orog 3.74 are lower; CorrDiff-TW1 3.77); for tasmax
-  RMSE (1.40 K) six entries are better (best 1.26 K).
-- Our **DeepESD** reproduces the published DeepESD's pr RMSE (4.33 vs. 4.32 mm/day), a check that data, training and
-  scoring are consistent with the benchmark.
-- All our models are deterministic regressions and rank poorly on the realism metrics: for pr LHD 36–40 of 40
-  published entries are better, for RALSD 22–26. They predict the conditional mean, which is smooth, has too much
-  drizzle and too weak extremes. Generative entries do far better there (e.g. FlowMatching-v1: pr RALSD 0.28, LHD 0.32).
-- Climatology has the lowest pr Mean Bias (0.17): all trained models share a dry bias (section 3)."""))
+- **AFM vs. U-Net:** the AFM is better on 7 of 12 metrics: all realism metrics plus pr Mean Bias. The U-Net keeps
+  the lower RMSE (pr 3.75 vs. 3.83 mm/day, tasmax 1.40 vs. 1.46 K) and is slightly better on PSS and IAV; tasmax
+  Mean Bias is a tie (0.24 vs. 0.25 K). This is the expected trade: the ensemble mean of a generative model is close to,
+  but not quite as good as, a regression trained for the conditional mean.
+- **Extremes and texture:** among the 40 published entries, only RCMGEM-mv-orog beats the AFM on pr Rx1day (5.79 vs.
+  5.90 mm/day) and tasmax TXx (0.41 vs. 0.52 K); two beat it on pr SDII (0.52) and tasmax RALSD (0.18 dB²). pr
+  RALSD drops from 19.7 (U-Net) to 0.81 dB² (9 published entries better).
+- **Weak spot: pr LHD 2.15 dB** (31 entries better; U-Net 3.18). The histogram matches within 0.5 dB up to about
+  100 mm/day but has too few days above 150 mm/day (section 7); the generative entries with low LHD (0.3) get this far
+  tail right.
+- pr RMSE: the U-Net is third of all entries (only Prithvi-UNet-orog 3.63 and RCMGEM-mv-orog 3.74 are lower), the AFM
+  fifth (CorrDiff-TW1, 3.77, also lower). RCMGEM-mv-orog is ahead of the AFM on all 12 metrics (IAV a tie)."""))
 cells.append(md("""**Future period.** For ESD the benchmark pools 2041–2060 and 2080–2099. The models never saw this climate,
 so this measures extrapolation. Which period the published LHD/PSS values refer to cannot be determined from the
 organisers' code; read those two with care."""))
@@ -219,12 +248,15 @@ plt.show()
 display(show_card(results.scorecard(EXP, FUTURE, RUNS, REF_MODELS, scores=scores)))
 display(results.rank_vs_published(card_f).style.set_caption("number of published entries that score better"))"""))
 cells.append(md(f"""{SNAP} — future period (extrapolation)
-- Rankings mostly carry over. U-Net pr RMSE 4.15 mm/day; lower are only Prithvi-UNet-orog (4.01), RCMGEM-mv-orog
-  (4.13) and CorrDiff-TW1 (4.14, both orography variants).
-- For temperature extrapolation the **linear** model is best of ours (tasmax Mean Bias 0.34 K, TXx 1.11 K). The U-Net
-  underestimates future hot extremes (TXx 2.24 K, PSS 0.951): the non-linear models extrapolate less reliably beyond
-  the training climate.
-- Climatology's tasmax Mean Bias jumps from 0.36 to 3.3 K because it has no warming by construction."""))
+- **Precipitation:** the AFM keeps its advantages. Its Rx1day bias (7.3 mm/day) is lower than that of every
+  published entry (best published: RCMGEM-mv-orog, 7.7); SDII 0.72 (3 entries better), RALSD 1.16 dB² (9 better).
+  pr RMSE 4.36 vs. 4.15 mm/day for the U-Net (the U-Net is 5th of all entries, the AFM 6th).
+- **Temperature: the AFM extrapolates worse than the U-Net.** tasmax RMSE 1.92 vs. 1.59 K (17 vs. 3 published entries
+  better), TXx 2.60 vs. 2.24 K, PSS 0.938 vs. 0.951, IAV 0.255 vs. 0.103 K. Only its texture stays excellent
+  (RALSD 0.30 dB², 1 entry better). The cause is a cold bias on hot summer days at the end of the century (sections 8
+  and 9).
+- Both pr LHD values are poor here (AFM 3.87, U-Net 4.13 dB; 37–38 entries better), for the same far-tail reason as
+  in the historical period."""))
 
 # 3. all metrics
 cells.append(md("""## 3. All metrics, all splits
@@ -239,16 +271,17 @@ for split in ["val", SPLIT, FUTURE]:
     cap("all metrics (rows: runs; columns: variable and metric).", split)
     display(all_metrics(split).style.format(fmt))"""))
 cells.append(md(f"""{SNAP}
-- **Systematic dry bias** of all trained models: the domain-mean pr bias is −0.39 (U-Net) to −0.55 mm/day (DeepESD),
-  i.e. −13 to −18% of the 3.0 mm/day mean, on validation and test alike. Likely cause: training with MSE on sqrt(pr)
-  predicts the conditional mean of sqrt(pr), and squaring it underestimates the mean of pr (Jensen's inequality).
-  Climatology, which averages raw pr, has no such bias. Fixable (e.g. train on raw pr or correct the variance);
-  generative models avoid it by sampling.
-- Validation and test scores are almost identical (U-Net pr RMSE 3.74 vs. 3.75, tasmax 1.41 vs. 1.40 K), so the two
-  validation years are a reliable stand-in for model selection.
-- Temporal correlation: pr 0.74 (linear) → 0.77 (DeepESD) → 0.81 (U-Net); tasmax ≥ 0.97 for all trained models
-  (climatology 0.90 from the seasonal cycle alone).
-- Wet-day frequency: linear and DeepESD produce too many wet days (+0.08, +0.05); the U-Net is nearly unbiased (+0.01)."""))
+- **Dry bias removed:** the U-Net's domain-mean pr bias is −0.39 mm/day (−13% of the 3.0 mm/day mean), caused by
+  training MSE on sqrt(pr) (Jensen's inequality). The AFM, trained on raw pr and sampling instead of averaging, is at
+  −0.09 mm/day (−3%) on the test period and −0.10 on validation.
+- **Probabilistic skill:** the AFM's CRPS is 23–24% lower than the U-Net's (pr 1.18 vs. 1.53 mm/day, tasmax 0.77 vs.
+  1.01 K; for the deterministic U-Net CRPS equals MAE). Its local extremes are closer too: P99 bias 2.6 vs. 5.7 mm/day.
+- **Day-to-day accuracy is slightly lower:** pr correlation 0.80 vs. 0.81, MAE 1.65 vs. 1.53 mm/day; tasmax
+  correlation 0.978 vs. 0.980. The AFM is slightly too warm (+0.21 K domain mean), the U-Net slightly too cold (−0.17 K).
+- Validation and test scores agree for both models (AFM pr RMSE 3.81 vs. 3.83 mm/day, tasmax 1.45 vs. 1.46 K), so the
+  two validation years remain a reliable stand-in for model selection.
+- **Future:** the AFM's tasmax RMSE grows from 1.46 K to 1.54 K (2041–2060) and 2.23 K (2080–2099), the U-Net's from
+  1.40 to 1.47 and 1.70 K; AFM correlation in 2080–2099 0.946 vs. 0.974."""))
 
 # 4. maps
 cells.append(md("""## 4. Maps on the test period
@@ -264,11 +297,14 @@ P.fig_bias_maps(D, "pr", [("mean", "mean (mm/day)"), ("Rx1day", "Rx1day (mm/day)
                 save=save(f"maps_pr_{SPLIT}"));"""))
 cells.append(md(f"""{SNAP}
 - Truth: mean precipitation, extremes and wet-day frequency are highest over the Alps, the Apennines and the Dinaric Alps.
-- All trained models are too dry almost everywhere, most over high terrain (mean bias above 1000 m: linear −0.57,
-  DeepESD −0.91, U-Net −0.78 mm/day; below 300 m: −0.41, −0.47, −0.33).
-- Extremes are underestimated everywhere: Rx1day by 19 (linear), 20 (DeepESD) and 11 mm/day (U-Net) on average,
-  against a truth of 52 mm/day; SDII by 2.9, 2.5 and 1.2 mm/day. The U-Net roughly halves the deficit.
-- Climatology rains nearly every day (wet-day fraction +0.6) because its smoothed mean is rarely below 1 mm/day."""))
+- **U-Net:** too dry at every grid point, most over high terrain (mean bias −0.78 mm/day above 1000 m, −0.33 below
+  300 m). **AFM:** small biases of both signs (28% of grid points too wet): slightly wet over the Alpine ridge and the
+  Dinaric Alps (+0.19 mm/day above 1000 m), slightly dry over the lowlands and the sea (−0.16 below 300 m).
+- Extremes: Rx1day is underestimated by 10.8 mm/day (U-Net) vs. 3.2 mm/day (AFM) on average, against a truth of
+  52 mm/day; SDII by 1.20 vs. 0.22 mm/day.
+- Wet-day fraction: the AFM has slightly too few wet days over the sea and the plains and too many over the mountains
+  (domain mean −0.01). Its outermost two grid rows have more drizzle than the interior (wet-day fraction +0.017 vs.
+  −0.010, SDII −0.76 vs. −0.18 mm/day): a thin frame visible in the maps, an edge effect of the network."""))
 cells.append(code("""cap("daily maximum temperature. Top row: RCM truth of the time mean, TXx (mean annual maximum), 99th percentile "
     "and IAV (standard deviation of annual means). Other rows: bias of each run.")
 P.fig_bias_maps(D, "tasmax", [("mean", "mean (K)"), ("TXx", "TXx (K)"),
@@ -276,11 +312,12 @@ P.fig_bias_maps(D, "tasmax", [("mean", "mean (K)"), ("TXx", "TXx (K)"),
                 save=save(f"maps_tasmax_{SPLIT}"));"""))
 cells.append(md(f"""{SNAP}
 - Truth: orography dominates the mean and the extremes; interannual variability is largest in the continental northeast.
-- Mean biases are small for all trained models (domain mean −0.17 to +0.05 K, 90% of grid points within about
-  ±0.5 K); the U-Net is slightly too cold, mostly in the lowlands.
-- Hot extremes are underestimated: TXx by 0.24 (linear), 0.40 (U-Net) and 0.98 K (DeepESD, up to −2.4 K locally).
-- All trained models slightly underestimate interannual variability (IAV −0.08 to −0.10 K). Climatology has no
-  day-to-day or interannual variability, so its TXx and 99th percentile are several kelvin too low."""))
+- Mean biases are small and of opposite sign: the U-Net is slightly too cold (−0.17 K domain mean; 90% of grid points
+  between −0.52 and +0.02 K), most in the northeast; the AFM slightly too warm almost everywhere (+0.21 K; 0.00 to
+  +0.43 K), most over land.
+- Hot extremes: the AFM's TXx is unbiased on average (−0.01 K; locally −4.5 to +6.3 K over the high Alps), the
+  U-Net's is 0.40 K too low, with a cold band along the coastlines that is much weaker in the AFM.
+- Both underestimate interannual variability by a similar amount (IAV −0.08 K U-Net, −0.09 K AFM)."""))
 cells.append(code("""cap("day-to-day skill at every grid point: RMSE (first and third figure; ensemble mean for stochastic runs) and "
     "temporal correlation with the truth (second and fourth). Correlation colour scales start at 0.5 (pr) and 0.9 "
     "(tasmax); lower values share the lightest colour.")
@@ -292,13 +329,15 @@ for var in EXP.variables:
                      vmin={"pr": 0.5, "tasmax": 0.9}.get(var, 0), vmax=1, save=save(f"corr_{var}_{SPLIT}"))
     plt.show()"""))
 cells.append(md(f"""{SNAP}
-- Errors follow the precipitation amount: pr RMSE is largest over the mountains (up to ~14 mm/day) and smallest over
-  the sea and plains. The U-Net has the lowest error almost everywhere (domain mean 3.62 vs. 4.11 DeepESD, 4.26
-  linear, 6.40 mm/day climatology).
-- pr correlation: U-Net 0.81 on average (lowest grid point 0.68), DeepESD 0.77, linear 0.74 (lowest 0.58);
-  climatology ≈ 0.1, i.e. no daily skill. For all models correlation is highest over the mountains, where
-  orographic rain follows the large-scale flow, and lowest over the Tyrrhenian Sea and the Adriatic.
-- tasmax correlation is above 0.92 at every grid point for all trained models, highest for the U-Net (0.98)."""))
+- The two models' error maps are nearly identical. pr RMSE follows the precipitation amount: largest over the
+  mountains, smallest over the sea and the plains (domain mean 3.62 mm/day U-Net, 3.72 AFM ensemble mean; highest
+  grid point 13.6 vs. 10.2).
+- pr correlation: U-Net 0.81 on average (lowest grid point 0.68), AFM 0.80 (0.63); for both highest over the
+  mountains, where orographic rain follows the large-scale flow, and lowest over the Tyrrhenian Sea and the Adriatic.
+- tasmax: RMSE 1.35 vs. 1.41 K (domain mean), correlation above 0.94 at every grid point for both (0.980 vs. 0.978).
+- Part of the AFM's small RMSE gap is sampling noise: a 12-member mean still retains 1/12 of the member variance.
+  The AFM's encoder alone is much less accurate than the U-Net (validation RMSE pr 4.62 mm/day, tasmax 2.39 K); it
+  only provides the starting point for the flow."""))
 
 # 5. example days
 cells.append(md("""## 5. Example days
@@ -328,11 +367,14 @@ for var, days in [("pr", dates[:2]), ("tasmax", dates[2:])]:
     P.fig_example_days(truth, preds, days, var, MG, save=save(f"days_{var}_{SPLIT}"))
     plt.show()"""))
 cells.append(md(f"""{SNAP}
-- All trained models place the weather correctly: the frontal band over the Adriatic and the Balkans in December, the
+- Both models place the weather correctly: the frontal band over the Adriatic and the Balkans in December, the
   widespread rain over the Alps, Italy and the Mediterranean in August, and the pattern of the hottest day.
-- The fields are much smoother than the RCM: no streaks or convective cells, and light rain where the truth is dry.
-- Amounts on these extreme days are too low: domain means 8.7–9.3 vs. 10.9 mm/day (December) and 10.3–12.1 vs.
-  15.3 mm/day (August); on the hottest day 28.6–29.6 vs. 29.9 °C (U-Net lowest)."""))
+- The U-Net and the AFM ensemble mean are smooth. Single AFM members have RCM-like texture: sharp rain edges and
+  dry gaps. The members differ from each other in these details, not in the large-scale pattern.
+- All twelve members agree closely on the domain-mean amount, and all are too low on these extreme days: 9.4–9.6 vs.
+  10.9 mm/day (December) and 12.8–13.0 vs. 15.3 mm/day (August); U-Net 9.3 and 12.0. Local peaks are realistic: the
+  members' maxima are 140–172 and 128–150 mm/day vs. 177 and 136 in the truth.
+- Hottest day: domain mean 28.8–28.9 °C in all members, 28.6 °C U-Net, 29.9 °C truth."""))
 
 # 6. spectra
 cells.append(md("""## 6. Spatial structure: power spectra
@@ -349,14 +391,15 @@ for var in EXP.variables:
 split_tab = pd.concat({var: pd.DataFrame(P.ralsd_split(D, var)).T for var in EXP.variables}, axis=1)
 display(split_tab.style.format(fmt).set_caption("RALSD (dB²)"))"""))
 cells.append(md(f"""{SNAP}
-- **tasmax:** up to the Nyquist wavenumber all trained models are within ~0.5 dB of the truth (resolved RALSD
-  0.2–0.6 dB²). The published RALSD differs only through the corner bins: DeepESD +1–2 dB there (total 0.56 dB²),
-  linear −4 dB (3.97), U-Net −6 to −8 dB (13.1).
-- **pr:** all models lack variance at every scale: 0.8–2 dB at the largest scales and 2–6 dB at 30–300 km. The U-Net
-  is closest at large scales, DeepESD furthest at 100–300 km. In the corner bins the U-Net loses most (−7 dB), which
-  doubles its RALSD (19.7 vs. 9.7 dB² over resolved scales).
-- For model development: RALSD is largely a pixel-scale texture score. A model needs realistic grid-scale detail to
-  score well, which is what generative models provide."""))
+- **pr:** the U-Net lacks variance at every scale (−0.8 to −1.6 dB above 300 km, −2.7 to −4 dB at 30–160 km, −6 to
+  −8 dB in the corner bins; RALSD 19.7 dB²). The AFM is close to the truth at the largest scales (+0.1 to −0.4 dB)
+  and −0.7 to −1.1 dB from 160 km down to the grid scale, −1.4 to −0.4 dB in the corner bins (RALSD 0.81 dB², 0.62
+  over resolved scales).
+- **tasmax:** the AFM is within ±0.3 dB up to the Nyquist wavenumber except at the very smallest scales (−0.6 dB)
+  and slightly too energetic in the corner bins (0 to +1.2 dB; RALSD 0.18 dB²). The U-Net is 0 to −1 dB below
+  Nyquist and −4 to −9 dB in the corner bins (RALSD 13.1 dB²).
+- The texture comes from sampling: the spectrum of the AFM *ensemble mean* (not plotted) is 2.5–3.3 dB too low for pr,
+  as smooth as the U-Net."""))
 
 # 7. distributions
 cells.append(md("""## 7. Distributions and extremes
@@ -370,25 +413,29 @@ for var in EXP.variables:
     P.fig_distributions(D, var, COLORS, save=save(f"distributions_{var}_{SPLIT}"))
     plt.show()"""))
 cells.append(md(f"""{SNAP}
-- **pr:** the RCM is dry (< 0.1 mm/day) on 49% of grid-point days; the U-Net 44%, DeepESD 34%, linear 31% and
-  climatology 0%. The regression models produce drizzle, the U-Net least.
-- The heavy tail is too light: the 99.99th percentile is 109 mm/day in the truth vs. 94 (U-Net), 85 (linear), 81
-  (DeepESD) and 19 (climatology); the 99th percentile is 34 mm/day in the truth vs. 29 (U-Net) and 25 (linear,
-  DeepESD).
-- **tasmax:** the distribution is reproduced well (PSS ≥ 0.97); only the upper tail is slightly too cool (99.99th
-  percentile 39.9 °C in the truth vs. 37.9–39.2 °C)."""))
+- **pr, heavy tail:** the AFM follows the truth up to the 99.9th percentile (99th 34.1 vs. 34.4 mm/day, 99.9th 66.8
+  vs. 67.8) and is close at the 99.99th (104 vs. 109); the U-Net is too light throughout (29.2, 58.3, 94). Beyond
+  about 150 mm/day the AFM has too few values: one member has 27 grid-point days ≥ 200 mm/day against 213 in the
+  truth, and its maximum is 233 vs. 368 mm/day. This far tail is what makes its LHD poor.
+- **pr, light rain:** the RCM is dry (< 0.1 mm/day) on 49% of grid-point days, the U-Net on 44%, the AFM on only 40%.
+  The AFM's extra values are traces between 0.1 and 1 mm/day (the wet-day fraction at 1 mm/day is nearly unbiased),
+  most likely sampling noise that survives where negative values are clipped at 0.
+- **tasmax:** both reproduce the distribution well (PSS 0.97–0.98). The AFM gets the cold tail closer to the truth;
+  its hot tail reaches a few kelvin beyond the truth's maximum at a handful of grid-point days (density < 10⁻⁸).
+  99.99th percentile 39.2 °C (AFM), 38.8 °C (U-Net), 39.9 °C (truth)."""))
 
 # 8. seasonal
 cells.append(md("## 8. Seasonal cycle of the bias"))
 cells.append(code("""cap("domain-mean bias (prediction − truth) per calendar month, pr (left) and tasmax (right).")
 P.fig_seasonal_bias(D, COLORS, EXP.variables, save=save(f"seasonal_{SPLIT}"));"""))
 cells.append(md(f"""{SNAP}
-- **pr:** all trained models are too dry in every month (−0.1 to −0.8 mm/day), most in autumn (September–November,
-  the wettest season with 3.5–3.8 mm/day): linear and DeepESD −0.6 to −0.8, U-Net −0.4 to −0.5 mm/day.
-- **tasmax:** biases stay within ±0.45 K in all months. Linear and DeepESD are slightly warm in December–January
-  (+0.3 to +0.4 K), the U-Net slightly cold in February–April and November (−0.3 to −0.44 K).
-- Climatology's monthly biases (±0.4 mm/day, up to −0.7 K) show the climate difference between the training and the
-  test period."""))
+- **pr:** the U-Net is too dry in every month (−0.20 to −0.53 mm/day, most from April to October). The AFM stays
+  within −0.21 to +0.05 mm/day, driest in August.
+- **tasmax:** the U-Net is slightly cold in February–April and November (−0.29 to −0.44 K). The AFM is slightly warm
+  in most months and clearly so in December–January (+0.58 and +0.65 K).
+- **Future (not plotted):** in 2080–2099 the AFM is far too cold in July and August (−2.8 and −3.2 K domain mean;
+  U-Net −1.4 and −1.6 K), and on the hottest 10% of days by 3.9 K (U-Net 1.9 K). Section 9 shows the consequence for
+  the warming signal."""))
 
 # 9. change
 cells.append(md("""## 9. Climate change signal (extrapolation)
@@ -414,13 +461,14 @@ display(change.style.format("{:+.2f}"))"""))
 cells.append(md(f"""{SNAP}
 - Truth: tasmax warms by 3.0 K on average, more over the northern land areas than over the sea. pr shows a
   north–south dipole: +10–15% north of the Alps, about −10% over the Mediterranean; +2.1% domain mean.
-- Climatology has no change by construction, so its error is the whole signal.
-- **tasmax:** linear and DeepESD reproduce the domain-mean warming (2.95 and 2.91 vs. 2.97 K); the U-Net
-  underestimates it by about 0.24 K almost everywhere (2.72 K), consistent with its weaker extrapolation of hot
-  extremes. The spatial pattern of the change is best captured by DeepESD and the U-Net (correlation with the truth
-  0.95–0.96 vs. 0.72 for linear).
-- **pr:** DeepESD and the U-Net reproduce the dipole (domain mean +1.1% and +1.9%); linear gives +4.4% because it
-  underestimates the drying in the south."""))
+- **tasmax:** both underestimate the warming: U-Net +2.72 K, AFM +2.50 K vs. +2.97 K. The AFM's deficit is largest
+  over the Mediterranean and the Adriatic (−0.4 to −0.6 K); the spatial pattern is captured by both (correlation with
+  the true change 0.962 and 0.955). The AFM misses warming because it is too cold on hot summer days at the end of
+  the century (section 8). Those temperatures lie outside the 1961–1980 training distribution; most likely the
+  generative model pulls them back towards it more strongly than the U-Net does. This is the extrapolation weakness the ESD test is
+  designed to expose; training on a warmer climate (the Emulator experiment) is the obvious remedy.
+- **pr:** the U-Net reproduces the dipole well (+1.9% domain mean, pattern correlation 0.94). The AFM makes the drying
+  in the south and southwest too strong (+1.0% domain mean, pattern correlation 0.92)."""))
 
 # 10. ensembles
 cells.append(md("""## 10. Ensemble calibration
@@ -436,8 +484,18 @@ else:
     plt.show()
     s = scores[(scores.split == SPLIT) & scores.run.isin(stoch) & scores.metric.isin(["CRPS", "Spread/skill"])]
     display(s.pivot_table(index="run", columns=["variable", "metric"], values="value").style.format(fmt))"""))
-cells.append(md("*No findings yet: all current runs are deterministic. This section fills in with the flow-matching "
-                "models of Phase C.*"))
+cells.append(md(f"""{SNAP}
+- **The AFM ensemble is under-dispersive:** its spread is about 60% of the ensemble-mean error (spread/skill 0.62
+  for pr, 0.59 for tasmax; ideal 1). The members vary small-scale detail but agree on large-scale amounts
+  (section 5), so they miss days on which the whole region is wetter or warmer than predicted.
+- **tasmax:** a U-shaped histogram: the truth lies below all 12 members in 21% of cases and above all in 14% (7.7%
+  each if calibrated). The asymmetry reflects the +0.2 K warm bias.
+- **pr:** nearly flat in the middle (ties at 0 mm are broken at random), but the truth exceeds all members in 12% of
+  cases: heavy rain is under-represented, consistent with the far tail in section 7.
+- Even so, the AFM's CRPS is 23–24% lower than the U-Net's (section 3). In the future period the calibration gets
+  worse for tasmax (spread/skill 0.48; truth above all 5 members in 33% of cases instead of 17%).
+- MCB (Debeire et al. 2026) is 0.0002 (pr) and 0.002 (tasmax); it averages squared deviations over many bins and
+  is therefore small even for the clearly U-shaped tasmax histogram."""))
 
 cells.append(md("""---
 **Adding a model.** Implement a `Downscaler` subclass in `src/dslab/models/` (see `linear.py` or `unet.py`),
@@ -445,9 +503,6 @@ register it, add `configs/models/<name>.yaml`, then `bash jobs/submit_model.sh a
 then evaluation) and `sbatch jobs/notebook.sbatch`. The run appears here automatically; update the findings notes.
 Pin its colour with `P.RUN_COLORS["<name>"] = P.SERIES[k]` before `run_colors`."""))
 
-PENDING = ("*Findings pending: the notes are rewritten once the `afm` run is trained and evaluated. The previous "
-           "notes (climatology, linear, DeepESD, U-Net) are in the git history of this notebook.*")
-cells = [md(PENDING) if c.cell_type == "markdown" and c.source.startswith("**Findings**") else c for c in cells]
 nb = nbf.v4.new_notebook(cells=cells)
 nb.metadata["kernelspec"] = {"name": "dslab", "display_name": "dslab (downscaling-lab)", "language": "python"}
 nb.metadata["language_info"] = {"name": "python"}

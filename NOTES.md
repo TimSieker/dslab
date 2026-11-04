@@ -227,3 +227,178 @@ run with `TRAIN_TIME=... EVAL_CPUS=40 bash jobs/submit_model.sh alps_esd afm`. T
 Smoke-test artefacts `afm-smoke` (runs/, predictions/, eval/; val only, 1.1 GB) can be deleted.
 The AFM code and the env change (PhysicsNeMo) are not committed yet.
 
+## 2026-11-02: AFM production run (user: 2 M samples, 12 members val/historical, 5 members future)
+
+- `torch.compile` added (`AFMNet.use_compiled`; training NCHW, sampling channels-last, static shapes, last
+  sampling batch padded), micro-batch 256 (whole batch, A100-80GB), `members_per_split` in `afm.yaml`,
+  `jobs/gpu.sbatch` (generic dslab command on 1 A100-80GB, 63 GB host memory).
+- Check 28651163 (13.5 min, 0.23 GPU-h): compile ≈ 6 min once per job; training 260 samples/s incl. validation;
+  62 GB GPU; compiled vs. eager samples with the same seed differ by 0.017 mm/day (pr) / 0.013 K (tasmax) on
+  average (field std 4.8 / 6.8): bf16 rounding amplified over 50 steps, equivalent.
+- Chain: fit 28651465 (limit 3 h, expected ~2.3 h) → predict 28651466 (limit 2 h, expected ~1.4 h) →
+  evaluate 28651467 (shared, 40 CPUs). GPU ≤ 5 GPU-h by limits, expected ≈ 3.6 GPU-h.
+
+| job | what | resources | wall | notes |
+|---|---|---|---|---|
+| 28651465 | AFM fit, 2.0 M samples (304 passes) | 1 A100-80GB | 2 h 11 min | 268 samples/s; best val at 1.1 M samples (0.522), overfits after (2.0 M: 0.553) |
+| 28651466 | AFM predict: val, historical (12 members), mid/end century (5 members) | 1 A100-80GB | 1 h 18 min | 50 Euler steps |
+| 28651467 | evaluate afm, 5 splits | shared, 40 CPUs | 16 min | |
+| 28658773, 28659014 | notebook (unet + afm) | shared, 8 CPUs | ~3 min each | |
+
+GPU used in this run 3.5 GPU-h; Phase C total ≈ 4.4 GPU-h (smoke 0.3, benchmark 0.4, compile check 0.23, run 3.5).
+
+### Results, AFM vs. U-Net (ALPS ESD, perfect predictors)
+
+Historical test (1981–2000; published rank = number of the 40 entries that score better):
+
+| | pr RMSE | pr Mean Bias | SDII | Rx1day | pr RALSD | LHD | tx RMSE | tx Mean Bias | TXx | tx RALSD | PSS | IAV |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| unet | 3.75 (2) | 0.43 (21) | 1.27 (15) | 12.0 (20) | 19.7 (26) | 3.18 (36) | 1.40 (6) | 0.24 (17) | 0.70 (4) | 13.1 (33) | 0.979 (16) | 0.098 (5) |
+| afm | 3.83 (4) | 0.24 (14) | 0.52 (2) | 5.90 (1) | 0.81 (9) | 2.15 (31) | 1.46 (8) | 0.25 (17) | 0.52 (1) | 0.18 (2) | 0.974 (16) | 0.111 (7) |
+
+- AFM better on 7/12 (all realism metrics + pr Mean Bias); U-Net keeps RMSE. Only RCMGEM-mv-orog beats the AFM on
+  Rx1day and TXx; RCMGEM-mv-orog is ahead of the AFM on all 12 metrics (IAV tie). CRPS 23–24% lower than U-Net.
+- Dry bias gone: domain-mean pr bias −0.09 (−3%) vs. −0.39 mm/day (U-Net, sqrt-MSE Jensen bias).
+- Weak spots: (1) pr LHD: histogram within 0.5 dB up to 100 mm/day but too few values > 150 mm/day (member max 233
+  vs. 368 mm/day); (2) ensemble under-dispersive, spread/skill ≈ 0.6, members differ in small-scale detail only;
+  (3) +0.21 K warm bias (winter +0.6 K); (4) slight drizzle frame in the outermost 2 grid rows (edge effect);
+  (5) more trace rain 0.1–1 mm/day (dry fraction 40% vs. 49%).
+- **Future extrapolation (tasmax) is worse than the U-Net:** 2080–2099 RMSE 2.23 vs. 1.70 K; July/August −2.8/−3.2 K
+  (U-Net −1.4/−1.6), hottest 10% of days −3.9 K (U-Net −1.9); warming 2.50 vs. 2.72 vs. 2.97 K (truth); truth above
+  all 5 members in 33% of cases. Precipitation keeps its advantages in the future (Rx1day 7.3 mm/day: better than
+  all 40 published entries), but the AFM over-dries the south (pr change +1.0% vs. +2.1% truth).
+- Training: validation loss rises after 1.1 M samples, so the planned extension to 6 M samples is not worthwhile
+  without more data/regularisation.
+
+Notebook regenerated (`notebooks/build_evaluation_notebook.py`, runs unet + afm, findings rewritten and checked
+against scores.json / diagnostics.nc). Plotting: `afm` gets the purple slot (green was hard to tell from the
+U-Net's teal); log-axis tick labels of the training curves fixed.
+
+Ideas, not started: anomaly/residual target for tasmax relative to the large-scale predictors (extrapolation);
+spatially correlated noise or larger σ_max for spread at large scales; Emulator experiment (trains on 2080–2099).
+
+### Notebook: predictors and downscaled variables (user request, 2026-11-02)
+
+New subsection under "Experiments": `results.variables_table(exp)` lists predictors (grouped by quantity with
+pressure levels and channel names), static fields and target variables with long names, units and grids, read from
+the config and the training files' metadata (works for alps_emulator too). A short table below says how `unet` and
+`afm` use them (input channels, target transform/normalisation).
+
+## 2026-11-03: LC-AFM (law-conditioned AFM), from the user's plan "pcAFM: from Burgers to 12 km"
+
+User decisions: keep joint training (encoder + denoiser, as AFM); add the unfiltered lapse-rate law;
+implement the conditioning in dslab; new name (PC-AFM clashes with Debeire et al.) -> **LC-AFM**, law-conditioned
+adaptive flow matching (no clash found in a web search). Stage 1 of the plan: laws T and O (benchmark data only).
+
+- `src/dslab/laws.py`: coarse operator (A block means, U bilinear, Q orthonormal basis of span U, P = Q Q^T),
+  laws T (H tasmax ≈ H T_free + c), Tfull (tasmax ≈ T_free + c), O (H pr ≈ H P_SB(h') + c; Smith & Barstad 2004 on
+  49 overlapping 32x32 patches with 700 hPa wind, N_m from t/z 850-700, C_w from q/t 850; H_w, tau_c, tau_f and a
+  gain fitted by grid search on 365 training days); offsets c and tolerances tau per calendar month and grid point
+  from training truth (truth scores 1); caches in work/cache/laws/.
+- `src/dslab/models/lcafm.py`: `LawConditioning` = exact Gaussian posterior (mean + Matheron noise) of the prior
+  N(E, sigma_max^2 I) given the law; Tfull elementwise, T/O by Woodbury with an r x r (r = 92) positive-definite
+  core, Cholesky per month; differentiable in E (joint training). `LCAFM(AFM)` registered as `lcafm`; AFM got
+  hooks `_aux` / `_base` (white AFM numerically unchanged), `base_only` sampling.
+- Fix on the way: MKL's multithreaded batched LU (indefinite 2r x 2r core with U A) returned invalid pivots on a
+  24-CPU compute node (job 28686232 failed); switched H to the orthogonal projector (laws VERSION 2), which makes
+  the core SPD. Test added (1 vs 24 threads identical).
+- CLI: `dslab predict --base-only` (writes `<run>-base`); evaluate: `Law <n>` residuals (member 0 and truth) and
+  `Elev. gradient bias` (pr). Config `configs/models/lcafm.yaml` (= afm.yaml + laws). Tests: tests/test_lcafm.py.
+- First law fit (VERSION 1, train): T residual 1.08 K vs 2.58 K sub-2° tasmax; Tfull 2.70 K; O explains only
+  6.4% of the sub-2° pr variance (gain 0.078, H_w 1 km, tau_c = tau_f = 2000 s).
+- Go/no-go (job 28687871, CPU 19 min; `scripts/law_check.py`, results work/eval/alps_esd/laws/law_check.csv;
+  VERSION 2 laws: T tolerance 0.99 K RMS vs 2.43 K sub-2° tasmax, Tfull 2.70 K, O explains 6.4% of sub-2° pr).
+  Residuals in tolerance units (truth 1.03-1.13 on val, 1.23-1.34 in 2080-2099): white base T 22.1, Tfull 2.3,
+  O 3.8 -> all "go". Conditioning the trained afm encoder on Tfull lowers the 2080-2099 tasmax RMSE 2.57 -> 2.23 K
+  and the JJA bias -0.87 -> -0.28 K (val 2.39 -> 2.14 K): the extrapolation lever. T only fixes fine scales
+  (residual 22 -> 0.89, bias unchanged). O is weak: mostly shrinks sub-2° noise, pr mean RMSE 4.62 -> 4.70.
+  Base | Tfull still has white fine-scale noise (law T 13.2): combining T and Tfull would need a 2r indefinite core
+  (LU on GPU) or CG; not implemented.
+
+### Laws notebook (user request, 2026-11-03): do the laws hold on the truth?
+
+`dslab laws --exp alps_esd` (src/dslab/law_diagnostics.py; CPU job 28688882, ~15 min) -> work/eval/alps_esd/laws/
+diagnostics.nc; `notebooks/laws.ipynb` (builder notebooks/build_laws_notebook.py, findings inline) plots skill beyond
+the training climatology, tolerance vs signal vs prior noise, calibration (mean z², α), z tails, drift, GCM predictors.
+- T: no day-to-day skill beyond climatology (−2%); acts as a fine-scale climatological prior with weight 0.87.
+- Tfull: 37–40% skill today, 70% in 2080–2099; α 1.03 / 1.17 / 1.84 (today / 2080–99 / GCM predictors);
+  JJA 2080–99 drift +0.06 K over land, −1.56 K over sea; GCM predictors: −1.0 K bias (−2.5 K in July).
+- O: 3% skill, heavy-tailed peaked residuals (|z|>4: 0.93% vs 0.006% Gaussian); w = 0.69.
+- Recommendation in the notebook: keep Tfull (α = 1 for the perfect tests), T optional, drop O for the first arms.
+
+### 2026-11-03 (cont.): GPU arms on hold; candidate laws for joint downscaling (user request)
+
+User: hold the GPU training; drop T and O, keep Tfull; find alternatives, including laws coupling extra downscaled
+variables (u, v, humidity, ...), as Debeire et al. downscale several variables; extract the data; describe each law's
+exact form and its estimate from the available data. Deleted (user OK): v1 law caches (1.4 GB), afm-smoke and
+lcafm-smoke outputs.
+- `dslab extract --exp alps_esd` (src/dslab/extra.py; `extra:` section in the experiment YAMLs): same ALADIN63 run
+  from the DKRZ CORDEX pool, native 453x453 Lambert grid, benchmark window x 165:293, y 113:241; periods 1961-80,
+  1981-2000, 2041-60, 2080-99; 13 daily fields (ua850, va850, zg500, huss, ps, tas, tasmin, evspsbl; uas, vas, quas,
+  qvas, upslope_pos from 6-hourly uas/vas and 3-hourly huss); 23 GB in work/cache/ALPS/extra/. Job 28690373,
+  48 CPUs, 7.5 min. Pool pr == benchmark pr exactly (first year of each period). Pitfall: "latest" is a link to the
+  version directory (files were read twice) -> one version directory only. Not in the pool: prw, ta850, hus850,
+  any 700/500 hPa wind or humidity.
+- `src/dslab/candidate_laws.py` (`dslab laws --candidates`): Tfull_tas, Tfull_tasmin, D (tas vs (tasmax+tasmin)/2),
+  U_lin / U_pos (terrain-forced ascent, linear / 6-hourly upslope), M (two-layer moisture budget), CC / CC0
+  (Clausius-Clapeyron scaling of wet-day ln P), plus tables for C (coarse consistency) and G (geostrophy at 2°).
+  Oracle tests: co-generated fields from the RCM. law_diagnostics refactored (SplitStats, masks; reproduces the
+  stored diagnostics exactly).
+- First numbers (train/val): D skill 0.97 (τ 0.50 K); Tfull_tas 0.20; Tfull_tasmin -0.05; CC -0.05 day-to-day.
+  C with perfect predictors exact (relative RMSE 0.3-0.7%, corr 1.000, missing 850 hPa ignored like the organisers'
+  remap); with GCM predictors relative RMSE 64-79%, z500 bias -28 m. G at 2°: ageostrophic fraction 0.19 (700/500
+  hPa), 0.28 (850 hPa), unchanged in 2080-99.
+- Candidate results (job 28690739, 23 min; variants job 28691393): skill beyond monthly climatology, oracle fields:
+  D 0.97-0.99; Tfull_tas 0.13-0.20 today, 0.64 in 2080-99; Tfull_tasmin -0.05/-0.12 today, 0.54 in 2080-99; U_lin
+  0.015, U_pos 0.05, M -0.04 (fixed E = 1 hurts; fitted E coefficient 0.04), CC -0.05 to -0.11; at ~40 km (both
+  sides Gaussian sigma 3 px): U_pos 0.18 today / 0.13 2080-99, M 0.14 / 0.10. Precip residuals strongly skewed
+  (|z|>4 ~1%). JJA 2080-99: truth 0.4 mm/day (land) to 1 mm/day (>1000 m) drier than U/M. Mean wet-day intensity
+  +7.4% (2080-99) vs +29.8% CC-implied at coarse t850 (ratio 0.27). Conclusion in the notebook: no linear
+  precipitation law worth conditioning on; C and D exact for jointly generated fields; Tfull for temperature.
+- Notebook laws.ipynb part 2 (sections 6-8 + summary); figures c_*.png in work/eval/alps_esd/laws/figures/.
+
+### 2026-11-03 (cont.): law analysis reworked (user: three criteria; counterparts; moisture; primitive equations)
+
+User points: (1) white noise destroys any structure, so conditioning the noise is valuable even for laws without daily
+information -> criterion (b) "does it shape the noise" (white-base go/no-go of the plan) added next to (a) holds and
+(c) daily information; (2) residuals need not be Gaussian (flow learns the rest; posterior mean = best linear estimate
+given correct second moments) -> notebook corrected; (3) pr / temperature need 2° counterparts; (4) moisture;
+(5) primitive equations (Coti Zelati et al. 2015, Nonlinearity 28, 625; arXiv 1406.3165). No model changes (user).
+- Counterparts: the benchmark's predictors contain no coarse pr/tas/tasmax/huss (perfect prognosis). Constructed:
+  RCM 2° area mean (perfect) and the GCM's daily pr, tas from /work/kd0956/CMIP5_waterpark (CNRM-CM5, only pr and tas
+  daily), conservatively regridded to the 2° grid (`dslab extract --gcm`, work/cache/ALPS/extra_gcm/).
+  `candidate_laws.coarse_counterparts` -> counterparts.csv.
+- New candidate laws: Qfull (huss vs coarse q profile at the elevation), Hyd (hydrostatic z500 from ps, tas, huss and
+  coarse t/q profile, 12 km), C_u850/C_v850/C_z500 in the generic framework (piecewise constant per full 2° cell).
+- Criterion (b): ms_z_white (truth + white noise at a conservative proxy: RMS of the sub-2° daily anomaly per field)
+  and ms_z_afmbase (trained AFM's white base, member 0) in diagnostics.nc and candidates.nc. Criterion (c):
+  scripts/law_value.py (AFM encoder E conditioned on T/Tfull/O and on the pointwise pr laws) -> law_value.csv.
+- `src/dslab/primitive.py` (`dslab laws --primitive`): at 2° hydrostatic thickness, momentum balance, 850-500 hPa
+  humidity budget vs 2° precipitation -> primitive.csv. First numbers: hydrostatic residual 10-12% of thickness
+  anomalies with T_v (18% with T); geostrophic residual 19% of the pressure gradient at 700/500 hPa, 27% at 850,
+  15/25% with tendency + advection; humidity layer budget vs 2° pr: corr of daily anomalies 0.26 (perfect), -0.02 (GCM).
+- Notebook laws.ipynb rebuilt from scratch around criteria (a)-(c), counterparts, primitive equations.
+- Fix (analysis code only): `coarse_counterparts` subtracted the climatology per point instead of per cell, so the
+  static sub-cell pattern counted as unpinned (tasmin came out negative). Now: share of the daily variability about
+  the period's own climatology, plus share of the climate-change signal (period minus training climatology).
+- Results (all in laws.ipynb findings, numbers from diagnostics.nc, candidates.nc, counterparts.csv, law_value.csv,
+  primitive.csv):
+  - Counterparts (exact 2° law, perfect): pins 61-62% of daily pr variability, 87-92% of the temperatures, 90% huss,
+    93-94% 850 hPa wind, 99% z500; 74% (pr) / 99% (temperatures) of the 2080-2099 change. GCM counterpart poor: pr
+    0.6-0.7 mm/day drier, relative RMSE 1.0, anomaly corr 0.38; tas +0.5-0.7 K, anomaly corr 0.71-0.74.
+  - (a) all laws mean z² 0.99-1.13 on unseen years; 2080-2099: C ~1, D 1.05, Hyd 1.16, Tfull 1.36, Qfull 1.89, pr laws
+    1.34-1.39. GCM predictors: C 7e4-1.3e6, Hyd 120, Qfull 4.3, Tfull 3.4. Tfull summer drift 2080-2099: land +0.10 K,
+    sea -1.57 K.
+  - (b) white base / truth (proxy): C_u/v 21, D 10.5, T 4.6, O 3.5, C_z500 3.3, Hyd 2.2, pr 12 km 1.7-2.0, Tfull 1.26;
+    AFM base: T 22, Tfull 2.4, O 2.0, pointwise pr laws 0.87-0.89 (< 1: tolerance wider than the base noise).
+  - (c) skill: Tfull 0.37 -> 0.70, Qfull 0.30 -> 0.56, pr laws <= 0.05 (12 km), <= 0.18 (40 km). Conditioned AFM
+    encoder mean: Tfull tasmax RMSE -11% (-13% end century, JJA bias -0.87 -> -0.28 K), T -2.5%; every pr law worsens
+    pr (O +2%, U/M +8%).
+  - Primitive: hydrostatic at 2° 10-12% (T_v), momentum residual 14-16% / 24-25% of PGF with tendency + advection,
+    humidity layer budget corr 0.25 (mean convergence only 14% of mean pr: moisture enters below 850 hPa). Only Hyd is
+    usable at 12 km (nonlinear -> linearise); the archive has no 12 km humidity on levels, no prw, no ta850.
+- Recommendations (to discuss with the user): Tfull + T for tasmax (needs J = [I; H] on one channel, small
+  implementation extension); pr needs a coarse counterpart (leaves the benchmark protocol) or joint generation;
+  co-generated ua850/va850/zg500 (C), tas/tasmin (D), zg500/ps/huss (Hyd); widen tolerances for GCM predictors.
+- Plot fixes: scorecard (group headings, axis labels), calibration (capped axis). Stale figures from the earlier
+  notebook version remain in work/eval/alps_esd/laws/figures/ (c_*.png, calibration_monthly.png).

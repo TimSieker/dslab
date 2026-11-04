@@ -207,6 +207,61 @@ def benchmark_tests(exp: Experiment, runs: list[str] | None = None) -> pd.DataFr
     return pd.DataFrame(rows).set_index("test")
 
 
+def _units(units: str, standard_name: str) -> str:
+    import re
+
+    if units == "1":
+        return "kg/kg" if "humidity" in standard_name else "–"
+    return re.sub(r"(\S+) (\S+)-1", r"\1/\2", units)
+
+
+def _grid_text(ds: xr.Dataset, exp: Experiment) -> str:
+    """'16 × 16, 2° lat/lon (32–62°N, 4°W–26°E)' or '128 × 128, 12.5 km, Lambert conformal'."""
+    if ds["lat"].ndim == 1:
+        lat, lon = ds["lat"].values, ds["lon"].values
+        ew = lambda v: f"{abs(v):g}°{'W' if v < 0 else 'E'}"  # noqa: E731
+        return (f"{len(lat)} × {len(lon)}, {abs(lat[1] - lat[0]):g}° lat/lon "
+                f"({lat.min():g}–{lat.max():g}°N, {ew(lon.min())}–{ew(lon.max())})")
+    ydim, xdim = ds["lat"].dims
+    dx = abs(float(ds[xdim][1] - ds[xdim][0]))
+    proj = {"lcc": "Lambert conformal"}.get((exp.grid_crs or {}).get("proj"), "curvilinear")
+    return f"{ds.sizes[ydim]} × {ds.sizes[xdim]}, {dx:g} {ds[xdim].attrs.get('units', '')}, {proj}"
+
+
+def variables_table(exp: Experiment) -> pd.DataFrame:
+    """Predictors, static fields and target variables of the experiment, with long names, pressure levels,
+    units and grids read from the training files (metadata only)."""
+    rows = []
+    with xr.open_dataset(exp.train.predictors) as ds:
+        grid = _grid_text(ds, exp)
+        groups: dict[str, list[str]] = {}
+        for name in exp.predictors:  # "u_850" -> quantity u at 850 hPa
+            qty, _, level = name.rpartition("_")
+            groups.setdefault(qty if level.isdigit() else name, []).append(name)
+        for qty, names in groups.items():
+            a = ds[names[0]].attrs
+            levels = [n.rpartition("_")[2] for n in names if n.rpartition("_")[2].isdigit()]
+            rows.append({"role": "predictor", "variable": qty, "description": a.get("long_name", ""),
+                         "levels": ", ".join(levels) + " hPa" if levels else "surface",
+                         "channels": ", ".join(names),
+                         "units": _units(a.get("units", ""), a.get("standard_name", "")), "grid": grid})
+    with xr.open_dataset(exp.static) as ds:
+        for name in ds.data_vars:
+            a = ds[name].attrs
+            rows.append({"role": "static", "variable": name, "description": a.get("long_name", ""),
+                         "levels": "surface", "channels": name,
+                         "units": _units(a.get("units", ""), a.get("standard_name", "")),
+                         "grid": _grid_text(ds, exp)})
+    with xr.open_dataset(exp.train.target) as ds:
+        for name in exp.variables:
+            a = ds[name].attrs
+            rows.append({"role": "target (downscaled)", "variable": name, "description": a.get("long_name", ""),
+                         "levels": "surface", "channels": name,
+                         "units": _units(a.get("units", ""), a.get("standard_name", "")),
+                         "grid": _grid_text(ds, exp)})
+    return pd.DataFrame(rows).set_index(["role", "variable"])
+
+
 def run_info(exp: Experiment, runs: list[str]) -> pd.DataFrame:
     rows = []
     for run in runs:

@@ -13,6 +13,7 @@ from pathlib import Path
 import matplotlib as mpl
 import matplotlib.pyplot as plt
 import numpy as np
+import pandas as pd
 from matplotlib.colors import LinearSegmentedColormap, LogNorm, Normalize, TwoSlopeNorm
 
 from .experiment import WORK
@@ -26,8 +27,11 @@ TRUTH_COLOR = INK
 FLOOR_COLOR = MUTED  # climatology baseline
 PUBLISHED_COLOR = "#c3c2b7"
 
-# Canonical run -> slot, so colours never depend on which runs happen to be loaded.
-CANONICAL_RUNS = ["linear", "deepesd", "unet", "flow", "flow_residual"]
+# Canonical run -> slot, so colours never depend on which runs happen to be loaded. afm takes the purple
+# slot because the green one next in line is hard to tell from the U-Net's teal; the LC-AFM arms take
+# orange and pink, which stay apart from teal and purple also for red-green colour vision deficiency.
+CANONICAL_RUNS = {"linear": 0, "deepesd": 1, "unet": 2, "flow": 3, "flow_residual": 4, "afm": 6,
+                  "lcafm-T-O": 1, "lcafm-Tfull-O": 4}
 RUN_COLORS: dict[str, str] = {}  # explicit overrides, e.g. RUN_COLORS["my_model"] = SERIES[5]
 
 BLUE_RAMP = ["#fcfcfb", "#cde2fb", "#9ec5f4", "#6da7ec", "#3987e5", "#256abf", "#184f95", "#0d366b"]
@@ -74,14 +78,15 @@ def setup_style() -> None:
 
 
 def run_colors(runs) -> dict[str, str]:
-    colors, free = {}, iter(SERIES[len(CANONICAL_RUNS):] + SERIES)
+    taken = set(CANONICAL_RUNS.values())
+    colors, free = {}, iter([c for i, c in enumerate(SERIES) if i not in taken] + SERIES)
     for run in runs:
         if run in RUN_COLORS:
             colors[run] = RUN_COLORS[run]
         elif run == "climatology":
             colors[run] = FLOOR_COLOR
         elif run in CANONICAL_RUNS:
-            colors[run] = SERIES[CANONICAL_RUNS.index(run)]
+            colors[run] = SERIES[CANONICAL_RUNS[run]]
     for run in sorted(r for r in runs if r not in colors):
         colors[run] = next(free)
     return colors
@@ -446,6 +451,11 @@ def fig_training_curves(histories: dict, colors: dict, save=None):
                 markeredgecolor=SURFACE, markeredgewidth=1.5, label="kept")
         ax.set_xscale("log")
         ax.set_yscale("log")
+        # Plain-number labels at 1-2-5 steps; the default minor labels collide on ranges below one decade
+        for axis, subs in ((ax.xaxis, (1, 2, 5)), (ax.yaxis, (1, 1.5, 2, 3, 5, 7))):
+            axis.set_major_locator(mpl.ticker.LogLocator(subs=subs))
+            axis.set_major_formatter(mpl.ticker.FuncFormatter(lambda v, _: f"{v:g}"))
+            axis.set_minor_formatter(mpl.ticker.NullFormatter())
         ax.set_xlabel("passes over the training data")
         ax.set_ylabel(h.attrs.get("loss_name", "loss"))
         ax.set_title(run)
@@ -468,5 +478,243 @@ def fig_rank_histograms(diags: dict, colors: dict, variables=("pr", "tasmax"), s
             ax.axhline(1 / len(h), color=INK2, lw=1)
             ax.set_title(f"{r} · {var} rank histogram (flat = calibrated)")
             ax.set_xlabel("rank of truth among members")
+    _savefig(fig, save)
+    return fig
+
+
+# ---- LC-AFM law diagnostics (notebooks/laws.ipynb; data from dslab.law_diagnostics)
+SPLIT_LABELS = {"train": "training years 1961–80", "val": "validation years 1967, 1975",
+                "historical_perfect": "1981–2000", "mid_century_perfect": "2041–2060",
+                "end_century_perfect": "2080–2099", "historical_imperfect": "1981–2000, GCM predictors",
+                "end_century_imperfect": "2080–2099, GCM predictors"}
+# colour = period, dashes = imperfect (GCM) predictors; training in primary ink as the reference
+SPLIT_STYLE = {"train": (INK, "-"), "val": (MUTED, "-"), "historical_perfect": (SERIES[0], "-"),
+               "mid_century_perfect": (SERIES[3], "-"), "end_century_perfect": (SERIES[1], "-"),
+               "historical_imperfect": (SERIES[0], "--"), "end_century_imperfect": (SERIES[1], "--")}
+LAW_TITLES = {"T": "T · lapse rate, sub-2° scales", "Tfull": "Tfull · lapse rate, all scales",
+              "O": "O · orographic pr, sub-2° scales"}
+LAW_UNITS = {"T": "K", "Tfull": "K", "O": "mm/day"}
+
+
+def _law_axes(n: int, panel_w: float, panel_h: float, ncols: int = 4, **kw):
+    """Small multiples for n laws, at most `ncols` per row; unused panels hidden. Returns (fig, axes list)."""
+    ncols = min(n, ncols)
+    nrows = int(np.ceil(n / ncols))
+    fig, axes = plt.subplots(nrows, ncols, figsize=(panel_w * ncols, panel_h * nrows), squeeze=False,
+                             layout="constrained", **kw)
+    flat = list(axes.flat)
+    for ax in flat[n:]:
+        ax.set_visible(False)
+    return fig, flat[:n], ncols
+
+
+def _split_dots(ax, splits, values, filled=True, color=INK2, xmin=None, label=None):
+    ypos = np.arange(len(splits))[::-1]
+    v = np.asarray(values, float)
+    shown = v if xmin is None else np.maximum(v, xmin)
+    ax.plot(shown, ypos, "o", ms=7, color=color, mfc=color if filled else SURFACE, mew=1.5, label=label,
+            zorder=3)
+    if xmin is not None:
+        for y, a in zip(ypos, v):
+            if a < xmin:
+                ax.annotate(f"◂ {a:.2g}", (xmin, y), xytext=(6, 0), textcoords="offset points", va="center",
+                            fontsize=7, color=INK2)
+    return ypos
+
+
+def fig_law_skill(summary, save=None):
+    """Per law: fraction of the day-to-day variance (about the training climatology of J x) that the law
+    explains, per split; filled = law (physics + monthly offset), hollow = physics alone."""
+    laws = list(dict.fromkeys(summary.index.get_level_values("law")))
+    splits = list(dict.fromkeys(summary.index.get_level_values("split")))
+    fig, axes, ncols = _law_axes(len(laws), 3.6, 0.32 * len(splits) + 1.4, sharey=True)
+    for ax, n in zip(axes, laws):
+        d = summary.loc[n].reindex(splits)
+        lo = -1.0  # common scale; anything below is drawn at the edge with its value printed
+        ypos = _split_dots(ax, splits, d["skill of physics alone"], filled=False, color=SERIES[0], xmin=lo,
+                           label="physics alone")
+        _split_dots(ax, splits, d["skill vs climatology"], filled=True, color=SERIES[0], xmin=lo,
+                    label="law (physics + monthly offset)")
+        ax.axvline(0, color=INK2, lw=1)
+        ax.set_xlim(lo - 0.05, 1)
+        ax.set_title(LAW_TITLES.get(n, n))
+        ax.set_xlabel("variance explained beyond climatology")
+        ax.grid(axis="y", visible=False)
+    for ax in axes[::ncols]:
+        ax.set_yticks(ypos, [SPLIT_LABELS.get(s, s) for s in splits])
+    fig.legend(*axes[0].get_legend_handles_labels(), loc="outside lower center", ncol=2)
+    _savefig(fig, save)
+    return fig
+
+
+def fig_law_calibration(summary, save=None, cap=4.0):
+    """Mean squared normalised residual per split (1 = tolerance calibrated); label: inflation alpha. Values above
+    `cap` are drawn at the cap as a triangle, with their alpha printed."""
+    laws = list(dict.fromkeys(summary.index.get_level_values("law")))
+    splits = list(dict.fromkeys(summary.index.get_level_values("split")))
+    fig, axes, ncols = _law_axes(len(laws), 3.6, 0.32 * len(splits) + 1.4, sharey=True, sharex=True)
+    hi = min(float(np.nanmax(summary["mean z²"])), cap)
+    for ax, n in zip(axes, laws):
+        d = summary.loc[n].reindex(splits)
+        z2s = d["mean z²"].astype(float).values
+        ypos = _split_dots(ax, splits, np.minimum(z2s, cap), color=SERIES[1])
+        for y, z2 in zip(ypos, z2s):
+            if z2 > cap:
+                ax.plot(cap, y, ">", ms=9, color=SERIES[1], zorder=4)
+            ax.annotate(f"α = {np.sqrt(z2):.3g}", (min(z2, cap), y), xytext=(7, 0), textcoords="offset points",
+                        va="center", fontsize=7, color=INK2)
+        ax.axvline(1, color=INK2, lw=1)
+        ax.set_xlim(0, max(hi, 1.6) * 1.35)
+        ax.set_title(LAW_TITLES.get(n, n))
+        ax.set_xlabel("mean z²  (1 = tolerance calibrated)")
+        ax.grid(axis="y", visible=False)
+    for ax in axes[::ncols]:
+        ax.set_yticks(ypos, [SPLIT_LABELS.get(s, s) for s in splits])
+    _savefig(fig, save)
+    return fig
+
+
+def fig_law_z_hist(ds, splits, save=None):
+    """Density of the normalised residual z (log scale) per split, against the standard normal."""
+    laws = list(ds.law.values)
+    fig, axes, ncols = _law_axes(len(laws), 3.6, 3.0, sharey=True)
+    z = ds.z.values
+    gauss = np.exp(-0.5 * z**2) / np.sqrt(2 * np.pi)
+    for ax, n in zip(axes, laws):
+        for s in splits:
+            col, ls = SPLIT_STYLE.get(s, (INK2, "-"))
+            ax.plot(z, ds.z_hist.sel(law=n, split=s), color=col, ls=ls, label=SPLIT_LABELS.get(s, s))
+        ax.plot(z, gauss, color=INK2, lw=1, ls=":", label="standard normal")
+        ax.set_yscale("log")
+        ax.set_ylim(1e-6, 1)
+        ax.set_xlim(-7, 7)
+        ax.set_title(LAW_TITLES.get(n, n))
+        ax.set_xlabel("normalised residual z = r / τ")
+    for ax in axes[::ncols]:
+        ax.set_ylabel("density")
+    axes[0].legend(loc="lower center", fontsize=7)
+    _savefig(fig, save)
+    return fig
+
+
+def fig_law_monthly(ds, name: str, splits, ylabel: str, ref: float | None = None, save=None):
+    """Seasonal cycle of a per-month law diagnostic (e.g. ms_z_month, bias_month) for several splits."""
+    laws = list(ds.law.values)
+    fig, axes, _ = _law_axes(len(laws), 3.6, 2.9)
+    for ax, n in zip(axes, laws):
+        for s in splits:
+            col, ls = SPLIT_STYLE.get(s, (INK2, "-"))
+            ax.plot(ds.month, ds[name].sel(law=n, split=s), color=col, ls=ls, marker="o", ms=3.5,
+                    label=SPLIT_LABELS.get(s, s))
+        if ref is not None:
+            ax.axhline(ref, color=INK2, lw=1)
+        ax.set_xticks(ds.month.values, list("JFMAMJJASOND"))
+        ax.set_title(LAW_TITLES.get(n, n))
+        ax.set_ylabel(ylabel.format(units=LAW_UNITS.get(n, "")))
+    fig.legend(*axes[0].get_legend_handles_labels(), loc="outside lower center", ncol=4)
+    _savefig(fig, save)
+    return fig
+
+
+def fig_law_sizes(ds, save=None):
+    """Per law and month (training years, domain RMS): the day-to-day signal the law has to explain
+    (J x about its monthly climatology), the tolerance tau (what the law leaves), and the prior noise s
+    of the base it conditions (sigma_max of the reference run)."""
+    laws = list(ds.law.values)
+    fig, axes = plt.subplots(1, len(laws), figsize=(3.6 * len(laws), 2.9), layout="constrained")
+    for ax, n in zip(np.atleast_1d(axes), laws):
+        d = ds.sel(law=n, split="train")
+        ax.plot(ds.month, np.sqrt(d.mse_clim_month), color=INK, marker="o", ms=3.5,
+                label="day-to-day signal (truth − climatology)")
+        ax.plot(ds.month, np.sqrt((ds.tol.sel(law=n) ** 2).mean(ds.tol.dims[-2:])), color=SERIES[0], marker="o",
+                ms=3.5, label="tolerance τ (truth − law)")
+        if "prior_noise" in ds:
+            ax.axhline(float(ds.prior_noise.sel(law=n)), color=SERIES[1], lw=1.4, ls="--",
+                       label=f"prior noise s ({ds.attrs.get('prior_noise_run', '')})")
+        ax.set_ylim(0, None)
+        ax.set_xticks(ds.month.values, list("JFMAMJJASOND"))
+        ax.set_title(LAW_TITLES.get(n, n))
+        ax.set_ylabel(f"domain RMS ({LAW_UNITS.get(n, '')})")
+    np.atleast_1d(axes)[0].legend(fontsize=7, loc="lower left")
+    _savefig(fig, save)
+    return fig
+
+
+def fig_law_maps(panels: list[dict], mg: MapGrid, ncols: int = 3, save=None):
+    """Grid of maps, one colour bar each: panels = [{field, title, cmap, norm, label, extend?}]."""
+    nrows = int(np.ceil(len(panels) / ncols))
+    fig, axes = map_axes(mg, nrows, ncols, panel=2.6, cbar_room=0.2)
+    for ax, p in zip(axes.flat, panels):
+        m = draw_map(ax, mg, p["field"], p["cmap"], p["norm"], p.get("title"))
+        _cbar(fig, m, ax, p.get("label"), extend=p.get("extend", "neither"))
+    for ax in list(axes.flat)[len(panels):]:
+        ax.set_visible(False)
+    _savefig(fig, save)
+    return fig
+
+
+def fig_law_scorecard(card, save=None):
+    """One row per law (grouped), three panels for the three criteria: (a) does it hold: mean z² today, in
+    2080-2099 and with GCM predictors (1 = calibrated); (b) does conditioning change the base: mean z² of a white
+    base (truth + conservative noise proxy, and the trained AFM's white base where it exists; truth = 1); (c) daily
+    information: variance explained beyond the training climatology, today and in 2080-2099.
+    card: DataFrame indexed by law with columns group, title, a_today, a_future, a_gcm, b_proxy, b_afm, c_today,
+    c_future."""
+    groups = list(dict.fromkeys(card["group"]))
+    rows, labels, ypos, heads, y = [], [], [], [], 0.0
+    for g in groups:
+        sub = card[card["group"] == g]
+        heads.append((g, y + 0.8))
+        for law, r in sub.iterrows():
+            rows.append(r)
+            labels.append(r["title"])
+            ypos.append(y)
+            y -= 1
+        y -= 0.6
+    ypos = np.array(ypos)
+    fig, axes = plt.subplots(1, 3, figsize=(13.5, 0.3 * len(rows) + 1.6), sharey=True, layout="constrained",
+                             gridspec_kw={"width_ratios": [1, 1, 1]})
+    df = pd.DataFrame(rows)
+
+    def dots(ax, col, color, filled, label, lo=None, hi=None):
+        v = df[col].astype(float).values
+        shown = v if lo is None else np.clip(v, lo, hi)
+        ax.plot(shown, ypos, "o", ms=6.5, color=color, mfc=color if filled else SURFACE, mew=1.4, label=label, zorder=3)
+        if lo is not None:
+            for yy, a, sv in zip(ypos, v, shown):
+                if np.isfinite(a) and a != sv:
+                    ax.annotate(f"{a:.3g}", (sv, yy), xytext=(5 if a > sv else -5, 5), textcoords="offset points",
+                                fontsize=6.5, color=INK2, ha="left" if a > sv else "right")
+
+    a, b, c = axes
+    dots(a, "a_today", INK, True, "1981–2000", 0.5, 20)
+    dots(a, "a_future", SERIES[1], True, "2080–2099", 0.5, 20)
+    dots(a, "a_gcm", SERIES[1], False, "1981–2000, GCM predictors", 0.5, 20)
+    a.axvline(1, color=INK2, lw=1)
+    a.set_xscale("log")
+    a.set_xlim(0.45, 25)
+    a.set_title("(a) does it hold?")
+    a.set_xlabel("mean z² of the truth (1 = calibrated)")
+    dots(b, "b_proxy", SERIES[0], False, "truth + white noise (conservative proxy)", 0.3, 40)
+    dots(b, "b_afm", SERIES[0], True, "trained AFM's white base", 0.3, 40)
+    b.axvline(1, color=INK2, lw=1)
+    b.set_xscale("log")
+    b.set_xlim(0.28, 50)
+    b.set_title("(b) does it shape the noise?")
+    b.set_xlabel("mean z² of a white base (truth ≈ 1)")
+    dots(c, "c_today", INK, True, "1981–2000", -0.5, 1)
+    dots(c, "c_future", SERIES[1], True, "2080–2099", -0.5, 1)
+    c.axvline(0, color=INK2, lw=1)
+    c.set_xlim(-0.55, 1.05)
+    c.set_title("(c) does it add daily information?")
+    c.set_xlabel("variance explained beyond climatology")
+    for ax in axes:
+        ax.grid(axis="y", visible=False)
+        ax.legend(loc="lower center", bbox_to_anchor=(0.5, 1.06), fontsize=7, ncol=1, frameon=False)
+        ax.set_ylim(ypos.min() - 0.7, 1.4)
+    for g, yy in heads:  # group headings in the gaps
+        a.text(0.01, yy, g, transform=a.get_yaxis_transform(), ha="left", va="center", fontsize=7.5,
+               fontweight="bold", color=INK2)
+    axes[0].set_yticks(ypos, labels)
     _savefig(fig, save)
     return fig

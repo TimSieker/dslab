@@ -1,0 +1,40 @@
+# Law-conditioned adaptive flow matching (LC-AFM): AFM (configs/models/afm.yaml, identical settings and
+# training budget) whose base noise is a Gaussian conditioned on linear physical laws; see
+# src/dslab/models/lcafm.py and src/dslab/laws.py. One law per variable:
+#   tasmax: T (lapse rate, sub-2° scales) or Tfull (lapse rate, all scales); pr: O (Smith-Barstad, sub-2°)
+# Arms: dslab fit --exp alps_esd --model lcafm --name lcafm-T-O     --set "laws=[T, O]"
+#       dslab fit --exp alps_esd --model lcafm --name lcafm-Tfull-O --set "laws=[Tfull, O]"
+model: lcafm
+params:
+  laws: [T, O]
+  # data: z-score per variable with training statistics (paper Sect. 2.2); statics: orography, latitude
+  transform: {}
+  normalize: variable
+  statics: [orog, lat]
+  # encoder and denoiser: SongUNet-L (Fotiadis et al. 2025): 32 channels, mult [1,2,2,4,4], ~12 M parameters
+  model_channels: 32
+  channel_mult: [1, 2, 2, 4, 4]
+  num_blocks: 4
+  attn_resolutions: [8]
+  dropout: 0.13
+  # objective (Eq. 2-3)
+  lambda_enc: 0.25
+  sigma_max_init: 1.0
+  sigma_max_beta: 0.01
+  # optimisation (Sect. 3.4); the paper trains 6e6 samples (2e6 in its ablation)
+  lr: 2.0e-4
+  betas: [0.9, 0.999]
+  batch_size: 256
+  micro_batch: 256   # whole batch in one pass: ~65 GB, needs an A100-80GB (compiled)
+  train_samples: 2000000
+  ema_halflife: 500000
+  eval_every: 100000
+  compile: true      # torch.compile: 1.8x faster training, 3.3x faster sampling (scripts/bench_afm.py)
+  # sampling (Eq. 4)
+  n_members: 12
+  # 2026-11-02 (user): 5 members for the future splits (the benchmark's scores use at most 5)
+  members_per_split: {mid_century_perfect: 5, end_century_perfect: 5}
+  n_steps: 50
+  rho: 7.0
+  sigma_min: 0.002
+  predict_batch: 64  # days per sampling batch (x members)

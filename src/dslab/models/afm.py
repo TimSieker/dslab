@@ -61,6 +61,21 @@ class AFMNet(nn.Module):
         n_cond = n_pred + n_static
         self.encoder = _songunet(out_hw, n_cond, n_out, "zero", net_kw, amp)
         self.denoiser = _songunet(out_hw, n_out + n_cond, n_out, "fourier", net_kw, amp)
+        self._fn = {}  # torch.compile'd encoder/denoiser (kept out of the state dict)
+        self._mf = torch.contiguous_format
+
+    def use_compiled(self, channels_last: bool = False) -> None:
+        """Run both networks through torch.compile; channels-last layout is faster for sampling,
+        slightly slower for training (scripts/bench_afm.py). Weights and results are unchanged."""
+        mf = torch.channels_last if channels_last else torch.contiguous_format
+        if self._fn and mf == self._mf:
+            return
+        self.encoder.to(memory_format=mf)
+        self.denoiser.to(memory_format=mf)
+        # static shapes: sampling pads its last batch, so each member count compiles once
+        self._fn = {"encoder": torch.compile(self.encoder, dynamic=False),
+                    "denoiser": torch.compile(self.denoiser, dynamic=False)}
+        self._mf = mf
 
     def cond(self, x):
         """Coarse predictors (B, C, h, w) -> interpolated to the target grid + static fields."""
@@ -69,7 +84,8 @@ class AFMNet(nn.Module):
         return torch.cat([up, self.static.expand(len(x), -1, -1, -1)], dim=1)
 
     def encode(self, cond):
-        return self.encoder(cond, torch.zeros(len(cond), device=cond.device)).float()
+        fn = self._fn.get("encoder", self.encoder)
+        return fn(cond.contiguous(memory_format=self._mf), torch.zeros(len(cond), device=cond.device)).float()
 
     def precond(self, s):
         """EDM coefficients for relative noise level s = sigma / sigma_max (B,), per channel."""
@@ -83,7 +99,8 @@ class AFMNet(nn.Module):
     def denoise_raw(self, x_t, s, cond, net=None):
         """Raw network output F and the preconditioning coefficients."""
         sigma, c_skip, c_out, c_in, c_noise = self.precond(s)
-        F = (net or self.denoiser)(torch.cat([c_in * x_t, cond], dim=1), c_noise).float()
+        inp = torch.cat([c_in * x_t, cond], dim=1).contiguous(memory_format=self._mf)
+        F = (net or self._fn.get("denoiser", self.denoiser))(inp, c_noise).float()
         return F, sigma, c_skip, c_out
 
     def denoise(self, x_t, s, cond, net=None):
@@ -103,10 +120,10 @@ class AFM(Downscaler):
         # objective
         lambda_enc=0.25, sigma_max_init=1.0, sigma_max_beta=0.01,
         # optimisation (Sect. 3.4); train_samples: 6e6 in the paper, 2e6 in its ablation
-        lr=2e-4, betas=[0.9, 0.999], batch_size=256, micro_batch=64, train_samples=2_000_000,
-        ema_halflife=500_000, ema_rampup=0.05, eval_every=100_000, amp=True, seed=0,
-        # sampling (Eq. 4)
-        n_members=12, n_steps=50, rho=7.0, sigma_min=0.002, predict_batch=16,
+        lr=2e-4, betas=[0.9, 0.999], batch_size=256, micro_batch=256, train_samples=2_000_000,
+        ema_halflife=500_000, ema_rampup=0.05, eval_every=100_000, amp=True, compile=True, seed=0,
+        # sampling (Eq. 4); members_per_split overrides n_members for single splits
+        n_members=12, members_per_split={}, n_steps=50, rho=7.0, sigma_min=0.002, predict_batch=64,
     )
 
     def __init__(self, variables, predictors, **params):
@@ -147,8 +164,17 @@ class AFM(Downscaler):
     def _autocast(self, dev):
         return torch.autocast(dev.type, dtype=torch.bfloat16, enabled=bool(self.params["amp"]) and dev.type == "cuda")
 
+    # ---- base distribution (subclasses, e.g. LC-AFM, replace it)
+    def _aux(self, split: Split, grid: Grid, dev) -> dict:
+        """Per-day tensors the base needs besides the predictors (none for the white base)."""
+        return {}
+
+    def _base(self, net, e, aux, gen=None):
+        """Base x0 = m + sigma_max * eps: returns (m, eps). AFM: m = E, eps white."""
+        return e, torch.randn(e.shape, device=e.device, generator=gen)
+
     # ---- loss (Eq. 3)
-    def _losses(self, net, x_lr, x1, dev, gen=None, ema=None):
+    def _losses(self, net, x_lr, x1, dev, gen=None, ema=None, aux=None):
         """Returns L_AFM, L_enc and the encoder's per-channel squared error (for sigma_max)."""
         B = len(x1)
         cond = net.cond(x_lr)  # fp32 (bilinear interpolation)
@@ -156,9 +182,9 @@ class AFM(Downscaler):
             e = net.encode(cond)
         t = torch.rand(B, device=dev, generator=gen)
         s = 1 - t  # sigma_t / sigma_max in (0, 1]
-        eps = torch.randn(x1.shape, device=dev, generator=gen)
+        m, eps = self._base(net, e, aux, gen)
         smax = net.sigma_max[None, :, None, None]
-        n = (e - x1) / smax + eps  # x_t = x1 + sigma n  (Eq. 2 rewritten)
+        n = (m - x1) / smax + eps  # x_t = x1 + sigma n  (Eq. 2 rewritten; x0 = m + sigma_max eps)
         sigma = s[:, None, None, None] * smax
         x_t = x1 + sigma * n
         with self._autocast(dev):
@@ -173,14 +199,15 @@ class AFM(Downscaler):
         return l_afm, l_enc, enc_sq
 
     @torch.no_grad()
-    def _validate(self, net, ema, Xv, Yv, dev):
+    def _validate(self, net, ema, Xv, Yv, dev, aux=None):
         gen = torch.Generator(device=dev).manual_seed(12345)  # same t, eps every evaluation
         tot_afm = tot_enc = 0.0
         mb = self.params["micro_batch"]
         net.eval()
         ema.eval()
         for i in range(0, len(Xv), mb):
-            la, le, _ = self._losses(net, Xv[i:i + mb], Yv[i:i + mb], dev, gen, ema)
+            ab = {k: v[i:i + mb] for k, v in (aux or {}).items()}
+            la, le, _ = self._losses(net, Xv[i:i + mb], Yv[i:i + mb], dev, gen, ema, ab)
             n = len(Xv[i:i + mb])
             tot_afm += la.item() * n
             tot_enc += le.item() * n
@@ -200,6 +227,7 @@ class AFM(Downscaler):
         Y = torch.from_numpy(self._standardise_y(train.y)).to(dev)
         Xv = torch.from_numpy(self.scaler.transform(val.x)).to(dev)
         Yv = torch.from_numpy(self._standardise_y(val.y)).to(dev)
+        aux_tr, aux_va = self._aux(train, grid, dev), self._aux(val, grid, dev)
 
         net = self.build_network(X.shape[1], Y.shape[1], grid.shape)
         net.grid.copy_(sample_grid(grid.lat, grid.lon, grid.pred_lat, grid.pred_lon))
@@ -207,6 +235,9 @@ class AFM(Downscaler):
         net.sigma_max.fill_(p["sigma_max_init"])
         net = net.to(dev).train()
         ema = copy.deepcopy(net.denoiser).eval().requires_grad_(False)
+        if p["compile"] and dev.type == "cuda":
+            torch.set_float32_matmul_precision("high")
+            net.use_compiled(channels_last=False)
         n_enc = sum(q.numel() for q in net.encoder.parameters())
         n_den = sum(q.numel() for q in net.denoiser.parameters())
         print(f"[fit] AFM: encoder {n_enc / 1e6:.2f} M + denoiser {n_den / 1e6:.2f} M parameters on {dev}",
@@ -225,7 +256,7 @@ class AFM(Downscaler):
             opt.zero_grad(set_to_none=True)
             for j in range(0, bs, mb):
                 b = idx[j:j + mb]
-                l_afm, l_enc, enc_sq = self._losses(net, X[b], Y[b], dev)
+                l_afm, l_enc, enc_sq = self._losses(net, X[b], Y[b], dev, aux={k: v[b] for k, v in aux_tr.items()})
                 loss = l_afm + p["lambda_enc"] * l_enc
                 (loss * len(b) / bs).backward()
                 with torch.no_grad():  # adaptive noise: EMA of the encoder's RMS error per channel
@@ -245,7 +276,7 @@ class AFM(Downscaler):
                     be.copy_(bn)
             if seen >= next_eval or step == n_steps - 1:
                 next_eval += p["eval_every"]
-                vl, va, ve = self._validate(net, ema, Xv, Yv, dev)
+                vl, va, ve = self._validate(net, ema, Xv, Yv, dev, aux_va)
                 now = time.time()
                 rec = {"epoch": seen / len(X), "samples": seen, "train_loss": acc["loss"] / acc["n"],
                        "train_l_afm": acc["l_afm"] / acc["n"], "train_l_enc": acc["l_enc"] / acc["n"],
@@ -307,9 +338,10 @@ class AFM(Downscaler):
         return torch.cat([s, torch.zeros(1, dtype=torch.float64)]).float()
 
     @torch.no_grad()
-    def sample(self, x_lr: torch.Tensor, n_members: int, gen: torch.Generator) -> torch.Tensor:
-        """Euler integration of the flow from E + sigma_max eps (s = 1) to s = 0; returns (M, B, V, H, W)
-        in standardised units. Step: x <- x + (D - x)(s_n - s_{n+1}) / s_n (Sect. 3.1)."""
+    def sample(self, x_lr: torch.Tensor, n_members: int, gen: torch.Generator, aux=None) -> torch.Tensor:
+        """Euler integration of the flow from the base x0 = E + sigma_max eps (s = 1) to s = 0; returns
+        (M, B, V, H, W) in standardised units. Step: x <- x + (D - x)(s_n - s_{n+1}) / s_n (Sect. 3.1).
+        With params["base_only"] the base draws x0 themselves are returned (diagnostics: what the flow adds)."""
         dev = x_lr.device
         net = self.net
         cond = net.cond(x_lr)
@@ -317,25 +349,40 @@ class AFM(Downscaler):
             e = net.encode(cond)
         cond = cond.repeat(n_members, 1, 1, 1)
         e = e.repeat(n_members, 1, 1, 1)
-        x = e + net.sigma_max[None, :, None, None] * torch.randn(e.shape, device=dev, generator=gen)
+        aux = {k: v.repeat(n_members, *([1] * (v.dim() - 1))) for k, v in (aux or {}).items()}
+        m, eps = self._base(net, e, aux, gen)
+        x = m + net.sigma_max[None, :, None, None] * eps
+        if self.params.get("base_only"):
+            return x.reshape(n_members, len(x_lr), *x.shape[1:])
         s_all = self.schedule().to(dev)
         for s, s_next in zip(s_all[:-1], s_all[1:]):
             with self._autocast(dev):
                 D = net.denoise(x, s.expand(len(x)), cond)
             x = D + (x - D) * (s_next / s)
-        return x.view(n_members, len(x_lr), *x.shape[1:])
+        return x.reshape(n_members, len(x_lr), *x.shape[1:])
 
     def predict(self, split: Split, grid: Grid, n_members: int = 1, seed: int = 0) -> np.ndarray:
         dev = device()
         self.net = self.net.to(dev).eval()
+        if self.params["compile"] and dev.type == "cuda":
+            torch.set_float32_matmul_precision("high")
+            self.net.use_compiled(channels_last=True)
         X = torch.from_numpy(self.scaler.transform(split.x))
+        aux = {k: v.cpu() for k, v in self._aux(split, grid, dev).items()}
         out = np.empty((n_members, len(split), len(self.variables), *grid.shape), np.float32)
         bs = self.params["predict_batch"]
         t0 = time.time()
+
+        def pad(a, nb):  # pad the last batch to the full size (no recompilation); padding is discarded
+            return a if nb == bs else torch.cat([a, a[-1:].expand(bs - nb, *a.shape[1:])])
+
         for k, i in enumerate(range(0, len(X), bs)):
             gen = torch.Generator(device=dev).manual_seed(seed * 1_000_003 + k)
-            z = self.sample(X[i:i + bs].to(dev), n_members, gen)
-            out[:, i:i + bs] = self._physical(z.cpu().numpy())
+            nb = len(X[i:i + bs])
+            xb = pad(X[i:i + bs], nb)
+            ab = {key: pad(v[i:i + bs], nb).to(dev) for key, v in aux.items()}
+            z = self.sample(xb.to(dev), n_members, gen, ab)[:, :nb]
+            out[:, i:i + nb] = self._physical(z.cpu().numpy())
             if k % 50 == 0:
                 print(f"[predict] {split.name}: {i + len(z[0])}/{len(X)} days ({time.time() - t0:.0f} s)", flush=True)
         return out

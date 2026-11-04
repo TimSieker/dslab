@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import time
 import warnings
+from functools import lru_cache
 
 import numpy as np
 import pandas as pd
@@ -37,6 +38,31 @@ def load_truth(exp: Experiment, split: str):
     if any(p.y is None for p in parts):
         raise ValueError(f"no ground truth for {split}")
     return np.concatenate([p.time for p in parts]), np.concatenate([p.y for p in parts])
+
+
+@lru_cache(maxsize=2)
+def _lawset(exp: Experiment):
+    """Laws fitted on the experiment's training truth (dslab.laws, cached on WORK); None if the experiment
+    lacks the predictors they need."""
+    from .laws import fit_cached
+
+    need = [f"{v}_{lev}" for v in "tzquv" for lev in (850, 700, 500) if not (v in "uv" and lev != 700)]
+    if not set(need) <= set(exp.predictors) or not {"pr", "tasmax"} <= set(exp.variables):
+        return None
+    return fit_cached(load_split(exp, "train"), load_grid(exp))
+
+
+def law_rhs(exp: Experiment, split: str):
+    """(laws, month index, {law: right-hand side b (T, H, W)}) for a (combined) split, or None."""
+    from .laws import months, phi_cached
+
+    law = _lawset(exp)
+    if law is None:
+        return None
+    grid = load_grid(exp)
+    parts = [load_split(exp, s) for s in _parts(exp, split)]
+    b = {n: np.concatenate([phi_cached(law, p, grid)[n] for p in parts]) for n in law.names}
+    return law, np.concatenate([months(p.time) for p in parts]), b
 
 
 def load_pred(exp: Experiment, run: str, split: str, var: str):
@@ -173,6 +199,7 @@ def evaluate_run(exp: Experiment, run: str, split: str, overwrite: bool = False)
     spec = M.RadialSpectrum(grid.shape)
     t_true, y_true = load_truth(exp, split)
 
+    laws = law_rhs(exp, split)
     scores, dsets, n_mem = {}, [], None
     for v, var in enumerate(exp.variables):
         t_pred, pred = load_pred(exp, run, split, var)
@@ -180,6 +207,16 @@ def evaluate_run(exp: Experiment, run: str, split: str, overwrite: bool = False)
             raise ValueError(f"{run}/{split}: prediction and truth time axes differ")
         n_mem = pred.shape[0]
         s, d = variable_scores(var, pred, y_true[:, v], t_true, spec)
+        if var == "pr":  # slope of the time-mean precipitation against elevation over land, pred - truth
+            land = grid.orog > 0
+            slope = lambda f: np.polyfit(grid.orog[land] / 1000, f[land], 1)[0]  # noqa: E731
+            s["Elev. gradient bias"] = float(slope(d["mean_true"] + d["bias_mean"]) - slope(d["mean_true"]))
+        if laws is not None:  # LC-AFM laws: residual in tolerance units (truth = 1 on training), member 0
+            law, mon, b = laws
+            for n in law.names:
+                if law.variable(n) == var:
+                    s[f"Law {n}"] = law.residual(n, pred[0], b[n], mon, grid)
+                    s[f"Law {n} (truth)"] = law.residual(n, y_true[:, v], b[n], mon, grid)
         scores[var] = s
         dsets.append(_diag_dataset(var, d, grid, t_true))
         del pred

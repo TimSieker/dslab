@@ -76,3 +76,18 @@ reference:
   experiment: ESD_pseudo_reality
   domain: ALPS
   splits: {historical_perfect: upper_left, mid_end_century_perfect: lower_right}
+
+# Extra fields of the same RCM run from the DKRZ CORDEX pool (EUR-11, native 453 x 453 Lambert grid), cut to the
+# benchmark's 128 x 128 window (index ranges, end exclusive), for the law tests and joint downscaling;
+# `dslab extract` writes them to work/cache/<domain>/extra/<period>/. Years <= 2005 are in "historical".
+extra:
+  root: /work/kd0956/CORDEX/data/cordex/output/EUR-11/CNRM/CNRM-CERFACS-CNRM-CM5
+  run: r1i1p1/CNRM-ALADIN63/v2
+  window: {x: [165, 293], y: [113, 241]}
+  periods: {p1961_1980: [1961, 1980], p1981_2000: [1981, 2000], p2041_2060: [2041, 2060], p2080_2099: [2080, 2099]}
+  # the driving GCM's own daily fields (CMIP5 pool), conservatively regridded to the 2° predictor grid: the
+  # coarse counterparts of pr and tas with imperfect predictors (`dslab extract --gcm`)
+  gcm:
+    root: /work/kd0956/CMIP5_waterpark/data/cmip5/output1/CNRM-CERFACS/CNRM-CM5
+    path: day/atmos/day/r1i1p1
+    variables: [pr, tas]

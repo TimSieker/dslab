@@ -39,6 +39,7 @@ sbatch jobs/baselines.sbatch alps_esd             # climatology + linear: fit, p
 sbatch jobs/dslab.sbatch fit --exp alps_esd --model linear --name linear-test --set n_pcs=[400]
 sbatch jobs/dslab.sbatch predict --exp alps_esd --run linear-test
 sbatch jobs/dslab.sbatch evaluate --exp alps_esd --run linear-test
+sbatch --time=03:00:00 jobs/gpu.sbatch fit --exp alps_esd --model afm   # any dslab command on 1 A100-80GB
 sbatch jobs/notebook.sbatch                        # execute notebooks/evaluation.ipynb headless
 ```
 
